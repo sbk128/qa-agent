@@ -29,9 +29,9 @@ screenshots/   Captured screenshots (gitignored)
 ## Getting started
 
 ```bash
-uv sync
-uv run playwright install chromium
-cp .env .env.local  # then fill in GROQ_API_KEY
+uv sync                              # install dependencies (uses uv.lock)
+uv run playwright install chromium   # install the browser
+cp .env.example .env                 # then open .env and fill in GROQ_API_KEY
 ```
 
 Phase 0 entry point (once implemented):
@@ -39,3 +39,19 @@ Phase 0 entry point (once implemented):
 ```bash
 python -m src.main --url https://example.com
 ```
+
+## Working across devices
+
+Clone, install, and recreate your local secrets:
+
+```bash
+git clone https://github.com/sbk128/qa-agent.git
+cd qa-agent
+uv sync
+uv run playwright install chromium
+cp .env.example .env                 # fill in your GROQ_API_KEY
+```
+
+`.env` (and `.env.local`) are gitignored, so your API key never leaves your
+machine. Commit and push your work before switching devices, and `git pull` on
+the other side to stay in sync.
