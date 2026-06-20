@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>QA Agent — Code Deep-Dive</title>
+<style>
+  :root {
+    --ink: #1a1a1a; --muted: #5b6470; --accent: #2c5f8a; --accent-soft: #eaf2f8;
+    --code-bg: #f5f6f8; --border: #d9dee4; --green: #2e7d4f; --amber: #b06f00; --red:#b5305f;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system,"Helvetica Neue",Arial,sans-serif; color:var(--ink);
+    line-height:1.55; font-size:11pt; margin:0; padding:0 14mm; }
+  h1 { font-size:25pt; color:var(--accent); margin:0 0 4px; letter-spacing:-0.4px; }
+  .subtitle { color:var(--muted); font-size:12pt; margin:0 0 6px; }
+  .meta { color:var(--muted); font-size:9.5pt; margin-bottom:20px; }
+  h2 { font-size:16pt; color:var(--accent); margin:30px 0 8px; padding-bottom:5px;
+    border-bottom:2px solid var(--accent-soft); page-break-after:avoid; }
+  h3 { font-size:12.5pt; margin:18px 0 6px; color:#243b53; page-break-after:avoid; }
+  h4 { font-size:11pt; margin:14px 0 4px; color:#16324f; page-break-after:avoid; }
+  p { margin:8px 0; }
+  ul,ol { margin:8px 0; padding-left:22px; }
+  li { margin:5px 0; }
+  code { font-family:"SF Mono",Menlo,Consolas,monospace; background:var(--code-bg);
+    padding:1px 5px; border-radius:4px; font-size:9.4pt; color:var(--red); }
+  pre { background:var(--code-bg); border:1px solid var(--border); border-radius:7px;
+    padding:11px 14px; overflow-x:auto; font-size:9pt; line-height:1.5; page-break-inside:avoid; }
+  pre code { background:none; padding:0; color:#243b53; font-size:9pt; }
+  .cmt { color:#7a8694; font-style:italic; }
+  table { border-collapse:collapse; width:100%; margin:12px 0; font-size:9.8pt; page-break-inside:avoid; }
+  th,td { border:1px solid var(--border); padding:7px 10px; text-align:left; vertical-align:top; }
+  th { background:var(--accent-soft); color:#243b53; font-weight:600; }
+  tr:nth-child(even) td { background:#fafbfc; }
+  .lead { background:var(--accent-soft); border-left:4px solid var(--accent);
+    padding:12px 16px; border-radius:0 7px 7px 0; margin:14px 0; }
+  .key { border-left:4px solid var(--green); background:#f0f8f3; padding:10px 15px;
+    border-radius:0 7px 7px 0; margin:12px 0; }
+  .gotcha { border-left:4px solid var(--amber); background:#fdf7ec; padding:10px 15px;
+    border-radius:0 7px 7px 0; margin:12px 0; }
+  strong { color:#16324f; }
+  .filepath { color:var(--muted); font-size:9.3pt; font-family:"SF Mono",Menlo,monospace; }
+  hr { border:none; border-top:1px solid var(--border); margin:24px 0; }
+  .page-break { page-break-before:always; }
+  .num { display:inline-block; width:20px; color:var(--accent); font-weight:700; }
+</style>
+</head>
+<body>
+
+<h1>QA Agent — Code Deep-Dive</h1>
+<p class="subtitle">How the code actually works: the Python &amp; Playwright mechanics, line by line</p>
+<p class="meta">Companion to the Walkthrough. This document assumes you know <em>what</em> each stage does and now asks <em>how</em>.</p>
+
+<div class="lead">
+<strong>Read this part first.</strong> Five ideas show up in <em>every</em> file. Once these click, the rest of the
+code stops looking like magic. We cover them once here, then use them everywhere below.
+</div>
+
+<h2>Part A — The five foundations</h2>
+
+<h3>1. <code>async</code> / <code>await</code> and why everything has it</h3>
+<p>Almost every function in this project is written <code>async def</code>, and almost every call has <code>await</code>
+in front of it. Here's the mental model.</p>
+
+<p>A normal function <em>runs to completion</em> before giving control back. But talking to a browser or an API means
+<strong>waiting</strong> — for a page to load, for a network reply. While we wait, the CPU has nothing to do. Blocking
+the whole program during that wait is wasteful.</p>
+
+<p>An <code>async def</code> function is a <strong>coroutine</strong>: a function that can <em>pause</em> itself at an
+<code>await</code> point, hand control back to a scheduler (the "event loop"), and resume later when the thing it was
+waiting for is ready.</p>
+
+<pre><code>async def goto(self, url, *, wait_until="domcontentloaded"):
+    await self.page.goto(url, wait_until=wait_until)   <span class="cmt"># pause here until navigation finishes</span>
+    ...</code></pre>
+
+<ul>
+  <li><code>await X</code> means: "start X, and pause me until X has a result." You can only use <code>await</code>
+      <em>inside</em> an <code>async def</code>.</li>
+  <li>Calling an async function <strong>without</strong> <code>await</code> does <em>not</em> run it — it just creates
+      a coroutine object that sits there doing nothing. Forgetting <code>await</code> is the #1 async bug. (Remember the
+      <code>match.count()</code> bug — a missing call/await silently returns the wrong thing.)</li>
+  <li>The whole chain has to be async top to bottom. That's why <code>main()</code> is <code>async</code> and the very
+      bottom of the script says <code>asyncio.run(main())</code> — that one line starts the event loop and runs the
+      coroutine to completion.</li>
+</ul>
+
+<div class="key">
+<strong>Why it matters here:</strong> reading a page calls <code>await</code> dozens of times (one per attribute, per
+element). Async lets those waits overlap with other work instead of freezing. You don't manage that overlap by hand —
+you just write <code>await</code> and the event loop handles the scheduling.
+</div>
+
+<h3>2. Playwright's two ways to point at an element: <code>ElementHandle</code> vs <code>Locator</code></h3>
+<p>This is the single most important Playwright concept, and the code uses <strong>both</strong> deliberately.</p>
+
+<table>
+  <thead><tr><th></th><th>ElementHandle</th><th>Locator</th></tr></thead>
+  <tbody>
+    <tr><td>Created by</td><td><code>page.query_selector_all(...)</code></td><td><code>page.locator(...)</code></td></tr>
+    <tr><td>What it is</td><td>A reference to <strong>one specific DOM node, captured right now</strong></td>
+        <td>A <strong>recipe</strong> for finding element(s) — re-run every time you use it</td></tr>
+    <tr><td>If the page changes</td><td>Can go <em>stale</em> (node detached → errors)</td>
+        <td>Always re-queries the live page → never stale</td></tr>
+    <tr><td>Used in</td><td>The <strong>Snapshotter</strong> (read the page once)</td>
+        <td>The <strong>Executor's _mui_select</strong> (act on a live, changing popup)</td></tr>
+  </tbody>
+</table>
+
+<p>The Snapshotter grabs handles because it's taking a <em>photograph</em> of the page at one instant:</p>
+<pre><code>handles = await page.query_selector_all("input, button, a, select, ...")
+for handle in handles:
+    tag = await handle.evaluate("el =&gt; el.tagName.toLowerCase()")  <span class="cmt"># this exact node</span></code></pre>
+
+<p>The Executor uses a Locator because the dropdown popup appears, changes, and disappears — a handle captured before
+the popup opened would be useless:</p>
+<pre><code>options = self.page.locator("[role='option']")   <span class="cmt"># a recipe, not a snapshot</span>
+count = await options.count()                      <span class="cmt"># evaluated NOW, against the open popup</span>
+await options.nth(target_idx).click()              <span class="cmt"># re-found NOW, then clicked</span></code></pre>
+<div class="gotcha">
+<strong>Why not handles everywhere?</strong> Because after we click a dropdown, the DOM mutates. A locator says "find
+the 3rd <code>[role='option']</code> <em>at the moment I click</em>" — robust to that mutation. A stale handle would throw.
+</div>
+
+<div class="page-break"></div>
+
+<h3>3. The Python ↔ browser bridge: <code>handle.evaluate("el =&gt; ...")</code></h3>
+<p>This pattern is everywhere in the Snapshotter and it confuses everyone at first. Here's the truth:</p>
+
+<p><strong>The string inside <code>evaluate(...)</code> is JavaScript, and it runs <em>inside the browser</em>, not in
+Python.</strong> Python sends that JS source code over to Chromium, Chromium executes it against the real DOM, and sends
+back the <em>result</em> (which must be JSON-serializable — a string, number, list, etc., never a live DOM node).</p>
+
+<pre><code>mui_label = await handle.evaluate("""el =&gt; {
+    const fc = el.closest('.MuiFormControl-root');   <span class="cmt"># runs in the browser</span>
+    if (!fc) return null;
+    const lbl = fc.querySelector('label, .MuiInputLabel-root');
+    return lbl ? lbl.innerText.trim() : null;        <span class="cmt"># a string comes back to Python</span>
+}""")</code></pre>
+
+<ul>
+  <li><code>el</code> is the handle you called it on — Playwright injects your specific node as the argument.</li>
+  <li>Inside, you have the full browser DOM API: <code>closest</code>, <code>querySelector</code>, <code>innerText</code>.</li>
+  <li>The return value crosses back to Python. Here it's <code>"Doctor"</code> or <code>None</code>.</li>
+</ul>
+
+<div class="key">
+<strong>Why drop into JS at all?</strong> Walking the DOM — "climb up to the form wrapper, find the label inside it" —
+is dozens of tiny operations. Doing each one as a separate <code>await</code> round-trip from Python would be slow and
+verbose. One <code>evaluate</code> does the whole walk <em>in the browser</em> and returns just the answer. It's one
+round-trip instead of twenty.
+</div>
+
+<h3>4. Pydantic models: typed data with automatic validation</h3>
+<p>Every <code>class X(BaseModel)</code> is a Pydantic model. Pydantic does three jobs for you:</p>
+
+<pre><code>class Element(BaseModel):
+    tag: str                              <span class="cmt"># required, must be a string</span>
+    element_type: str | None = None       <span class="cmt"># optional, defaults to None</span>
+    widget_type: WidgetType = "native"    <span class="cmt"># must be one of the allowed Literals</span>
+    options: list[str] | None = None</code></pre>
+
+<ol>
+  <li><strong>Validation on construction.</strong> <code>Element(tag=123)</code> raises an error — <code>tag</code> must
+      be a string. You can't build a malformed Element by accident.</li>
+  <li><strong>Defaults.</strong> Fields with <code>= ...</code> are optional. That's why old code that never set
+      <code>options</code> still worked — it defaulted to <code>None</code>.</li>
+  <li><strong>Literal types are enums.</strong> <code>WidgetType = Literal["native", "mui_select"]</code> means the
+      field can <em>only</em> be one of those two strings. Typo "muiselect"? Validation error. This is how the model
+      documents and enforces the allowed widget kinds.</li>
+</ol>
+
+<div class="gotcha">
+<strong>The mutable-default trap (and how this code avoids it).</strong> In <code>SafetyVerdict</code> you'll see
+<code>signals: list[str] = Field(default_factory=list)</code> — <em>not</em> <code>= []</code>. Writing <code>= []</code>
+as a default in Python is a classic bug: <em>every</em> instance would share the <em>same</em> list object. <code>default_factory=list</code>
+tells Pydantic "call <code>list()</code> fresh for each new object." Remember this one — it bites every Python beginner.
+</div>
+
+<p>Two Pydantic methods you'll see constantly:</p>
+<ul>
+  <li><code>obj.model_dump()</code> → turns the object into a plain <code>dict</code> (used in your print logs).</li>
+  <li><code>Schema.model_validate_json(raw)</code> → parses a JSON <em>string</em> and validates it into an object
+      (used to turn the LLM's reply into a typed result — see Part B).</li>
+</ul>
+
+<h3>5. <code>Protocol</code>: the LLM provider is swappable by shape, not inheritance</h3>
+<p class="filepath">src/llm/base.py</p>
+<pre><code>@runtime_checkable
+class LLMProvider(Protocol):
+    async def text(self, prompt: str, *, model=None, ...) -&gt; str: ...
+    async def structured(self, prompt: str, schema, *, ...) -&gt; BaseModel: ...</code></pre>
+<p>A <code>Protocol</code> defines a <em>shape</em>: "anything with these two methods counts as an LLMProvider."
+<code>GroqProvider</code> does <strong>not</strong> inherit from <code>LLMProvider</code> — it just happens to have
+<code>text</code> and <code>structured</code> methods with the right signatures, so it qualifies. This is "structural
+typing" (a.k.a. duck typing, checked by the type checker). The payoff: to add an OpenAI provider later, you write a
+class with the same two methods and change one line in <code>get_provider()</code> — nothing else in the codebase
+changes, because everything depends on the <em>shape</em>, not the concrete class.</p>
+
+<div class="page-break"></div>
+
+<h2>Part B — The LLM call, demystified</h2>
+<p class="filepath">src/llm/groq_provider.py</p>
+<p>Everywhere the code "asks the AI," it calls <code>llm.structured(prompt, SomeModel)</code> and gets back a validated
+object. How does free-form text become a guaranteed-valid Pydantic object? Here's the whole trick:</p>
+
+<pre><code>async def structured(self, prompt, schema, *, model=None, temperature=0.0, system=None):
+    json_schema = schema.model_json_schema()           <span class="num">1</span>
+    sys_msg = (
+        (system + "\n\n" if system else "")
+        + "Respond with a single JSON object that matches this JSON schema. "
+        + "Do not wrap it in markdown.\n"
+        + json.dumps(json_schema)                       <span class="num">2</span>
+    )
+    resp = await self._call(
+        model=model or self._default_model,
+        messages=[
+            {"role": "system", "content": sys_msg},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=temperature,
+        response_format={"type": "json_object"},        <span class="num">3</span>
+    )
+    raw = resp.choices[0].message.content or "{}"        <span class="num">4</span>
+    try:
+        return schema.model_validate_json(raw)           <span class="num">5</span>
+    except ValidationError:
+        log.error("groq.structured.invalid_json", raw=raw)
+        raise</code></pre>
+
+<ol>
+  <li><span class="num">1</span> <code>schema.model_json_schema()</code> — Pydantic generates a <strong>JSON Schema</strong>
+      (a machine-readable description) of the model. For <code>FormFill</code> it describes "an object with a
+      <code>values</code> field that is a string→string map."</li>
+  <li><span class="num">2</span> That schema is jammed into the <strong>system message</strong> as instructions:
+      "reply with JSON matching this shape." Now the model knows the exact structure expected.</li>
+  <li><span class="num">3</span> <code>response_format={"type": "json_object"}</code> is <strong>JSON mode</strong> —
+      the API guarantees the reply is syntactically valid JSON (no prose, no markdown fences). This removes a whole
+      class of parsing failures.</li>
+  <li><span class="num">4</span> Pull the text out of the API response envelope. <code>or "{}"</code> guards against a
+      null content.</li>
+  <li><span class="num">5</span> <code>model_validate_json(raw)</code> — parse <em>and</em> validate in one step. If the
+      JSON matches the schema, you get a typed object (<code>FormFill</code>, <code>SafetyVerdict</code>, …). If it
+      doesn't, Pydantic raises <code>ValidationError</code> and we log the bad payload.</li>
+</ol>
+
+<div class="key">
+<strong>The big idea:</strong> the LLM's job is reduced to "fill in this exact JSON shape," and Pydantic is the bouncer
+at the door that refuses anything malformed. Callers like <code>happy_path</code> or <code>SafetyGate</code> never see
+raw text — they get a clean, typed object or an exception. That's why the rest of the code can be so tidy.
+</div>
+
+<h3>Why <code>_call</code> wraps everything in a retry loop</h3>
+<pre><code>for attempt in range(self._max_retries):
+    try:
+        return await self._client.chat.completions.create(**kwargs)
+    except RateLimitError as e:
+        delay = self._retry_after(e) or self._backoff(attempt)
+        await asyncio.sleep(delay)        <span class="cmt"># wait, then loop again</span>
+    except (APIConnectionError, APITimeoutError, APIStatusError) as e:
+        await asyncio.sleep(self._backoff(attempt))</code></pre>
+<p>APIs fail transiently — rate limits, blips. Rather than crash the whole test run, <code>_call</code> retries up to
+5 times with <strong>exponential backoff</strong>: <code>_backoff</code> returns <code>base * 2^attempt</code> (1s, 2s,
+4s, 8s…) capped at 30s, plus a little random "jitter" so many clients don't all retry in lockstep. For rate limits it
+first honors the server's <code>retry-after</code> header if present. This is the difference between a toy and something
+that survives a real run.</p>
+
+<div class="page-break"></div>
+
+<h2>Part C — Reading the page, line by line</h2>
+<p class="filepath">src/browser/snapshotter.py — extract_elements()</p>
+
+<h3>The query</h3>
+<pre><code>handles = await page.query_selector_all(
+    "input, button, a, select, textarea, "
+    "[role='button'][aria-haspopup='listbox'], "
+    "[role='combobox']"
+)</code></pre>
+<p>Note the three adjacent strings with no commas between them — Python <strong>implicitly concatenates</strong> string
+literals that sit next to each other, so this is <em>one</em> selector string. (This is exactly the spot where an
+accidental comma once turned it into three arguments and crashed.) The result is a <code>list[ElementHandle]</code>.</p>
+
+<h3>The per-element loop — what each line extracts</h3>
+<pre><code>for handle in handles:
+    if await handle.get_attribute("aria-hidden") == "true":
+        continue                                      <span class="num">1</span>
+    tag = await handle.evaluate("el =&gt; el.tagName.toLowerCase()")   <span class="num">2</span>
+    element_type = await handle.get_attribute("type")               <span class="num">3</span>
+    role = await handle.get_attribute("role")
+    aria_haspopup = await handle.get_attribute("aria-haspopup")
+    widget_type = "mui_select" if (
+        aria_haspopup == "listbox" or role == "combobox"
+    ) else "native"                                   <span class="num">4</span>
+    options  = await self._extract_options(handle, tag, widget_type)
+    name     = await self._resolve_name(handle, tag)
+    selector = await self._pick_selector(handle, tag)
+    required = await handle.get_attribute("required") is not None    <span class="num">5</span>
+    visible  = await handle.is_visible()              <span class="num">6</span>
+    disabled = await handle.is_disabled()
+    kind     = await self._infer_kind(handle, tag, element_type, name)
+    in_form  = await handle.evaluate("el =&gt; !!el.closest('form')")   <span class="num">7</span>
+    results.append(Element(...))</code></pre>
+
+<ol>
+  <li><span class="num">1</span> <strong>Skip phantoms.</strong> <code>get_attribute</code> returns a <em>string or
+      <code>None</code></em>. MUI scatters invisible helper inputs with <code>aria-hidden="true"</code>; <code>continue</code>
+      skips to the next handle so we never fill those.</li>
+  <li><span class="num">2</span> <strong>Tag name via JS</strong> because there's no direct handle property for it —
+      one tiny <code>evaluate</code> returns <code>"div"</code>, <code>"input"</code>, etc.</li>
+  <li><span class="num">3</span> <code>type</code> is just an attribute (<code>"text"</code>, <code>"email"</code>,
+      <code>"submit"</code>…). For a <code>&lt;div&gt;</code> it's <code>None</code>.</li>
+  <li><span class="num">4</span> <strong>The widget decision.</strong> A Python ternary: if the element advertises a
+      listbox popup or is a combobox, it's an MUI Select; otherwise native. This one boolean drives the whole
+      fill-strategy later.</li>
+  <li><span class="num">5</span> <strong><code>is not None</code> turns presence into a bool.</strong> A required field
+      has the attribute present (value <code>""</code>); a non-required one returns <code>None</code>. We don't care about
+      the value, only whether it exists — hence <code>is not None</code>.</li>
+  <li><span class="num">6</span> <code>is_visible()</code> / <code>is_disabled()</code> are Playwright
+      <strong>actionability</strong> checks — they account for CSS (<code>display:none</code>, <code>visibility:hidden</code>,
+      zero size). We store these so downstream code can skip things a user couldn't actually use.</li>
+  <li><span class="num">7</span> <strong><code>!!el.closest('form')</code></strong> — <code>closest('form')</code> climbs
+      ancestors looking for a <code>&lt;form&gt;</code>; it returns the node or <code>null</code>. The <code>!!</code> in
+      JS coerces that to a real <code>true</code>/<code>false</code>, which crosses back to Python as a bool. This is the
+      <code>in_form</code> flag that powers <code>find_submit</code>.</li>
+</ol>
+
+<h3>_resolve_name — the label-finding ladder, in detail</h3>
+<p>It tries clue after clue and <code>return</code>s the moment one works (so order = priority):</p>
+<pre><code>mui_label = await handle.evaluate("""el =&gt; {
+    const fc = el.closest('.MuiFormControl-root');
+    if (!fc) return null;
+    const lbl = fc.querySelector('label, .MuiInputLabel-root');
+    return lbl ? lbl.innerText.trim() : null;
+}""")
+if mui_label:
+    return mui_label                  <span class="cmt"># &lt;- this rung fixed "Today" vs "Time"</span></code></pre>
+<p>MUI wraps each field in a <code>.MuiFormControl-root</code> div containing both the control and its label. We climb to
+that wrapper and read the label inside — so we get the field's <em>name</em> ("Time", "Doctor"), not its current
+<em>value</em> ("Today", "Dr. Vivek"). The remaining rungs (<code>aria-label</code> → <code>aria-labelledby</code> →
+<code>&lt;label for&gt;</code> → <code>placeholder</code> → button text → <code>"(unnamed)"</code>) are tried only if the
+one above returned nothing. Each rung handles a different way real apps label fields.</p>
+
+<div class="page-break"></div>
+
+<h3>_infer_kind — a cascade from most to least reliable signal</h3>
+<pre><code>if tag in ("button", "a"): return "unknown"             <span class="cmt"># not data fields</span>
+if tag == "input" and element_type in ("submit","reset","button","checkbox",...):
+    return "unknown"
+if element_type in type_map: return type_map[element_type]   <span class="cmt"># type="email" -&gt; email</span>
+<span class="cmt"># then autocomplete attribute...</span>
+<span class="cmt"># then keyword-match label+id+placeholder against _KINDKEYWORDS</span>
+return "unknown"</code></pre>
+<p>The order is deliberate: a real HTML <code>type="email"</code> is rock-solid, so it's checked first; keyword-guessing
+the label is a last resort. One subtle line:</p>
+<pre><code>real_name = name if name != "(unnamed)" else ""</code></pre>
+<p>The sentinel <code>"(unnamed)"</code> literally contains the substring "name", which would falsely match the
+<code>name</code> keyword bucket. Blanking it out prevents that false positive — a small but real bug-fix baked into the code.</p>
+
+<h3>_pick_selector — generating a reliable address</h3>
+<p>Three cooperating methods. <code>_candidates</code> proposes selectors strongest-first:</p>
+<pre><code>data-testid  →  #id (if not autogenerated)  →  tag[name="..."]  →  a[href]  →  tag:text-is("...")</code></pre>
+<p><code>_pick_selector</code> returns the first candidate that is <em>unique</em>:</p>
+<pre><code>for candidate in await self._candidates(handle, tag):
+    if await self._is_unique(candidate):    <span class="cmt"># query_selector_all(...) returns exactly 1?</span>
+        return candidate
+return await self._positional_selector(handle)   <span class="cmt"># last resort</span></code></pre>
+<p><code>_is_unique</code> simply runs the selector and checks <code>len(matches) == 1</code> — a selector that matches two
+elements is useless for "click <em>this</em> one." When nothing unique exists, <code>_positional_selector</code> builds a
+path in JS by walking parent-by-parent up to <code>&lt;body&gt;</code>, adding <code>:nth-of-type(n)</code> whenever
+siblings share a tag:</p>
+<pre><code>el =&gt; {
+  const parts = [];
+  while (el &amp;&amp; el.tagName !== 'BODY') {
+    let sel = el.tagName.toLowerCase();
+    const sameTag = [...el.parentElement.children].filter(c =&gt; c.tagName === el.tagName);
+    if (sameTag.length &gt; 1) sel += `:nth-of-type(${sameTag.indexOf(el)+1})`;
+    parts.unshift(sel);
+    el = el.parentElement;
+  }
+  return parts.join(' &gt; ');
+}</code></pre>
+<p>That's the source of your <code>div &gt; div &gt; main &gt; div:nth-of-type(2) &gt; ...</code> selectors. Two guards
+protect selector quality: <code>_looks_autogenerated</code> rejects ids containing CSS-unsafe characters
+(<code>:.[](){}#,</code> — React's <code>useId</code> emits <code>:r5l:</code>) or ending in a random-looking suffix
+(the <code>_AUTOGEN_ID</code> regex), and <code>_escape</code> backslash-escapes quotes before embedding text in a
+<code>:text-is("...")</code> selector so the text can't break the selector syntax.</p>
+
+<h2>Part D — Generating data &amp; acting on it</h2>
+
+<h3>fillable() — a filter, expressed as an explicit loop</h3>
+<p class="filepath">src/data/generator.py</p>
+<pre><code>def fillable(elements):
+    out = []
+    for el in elements:
+        if not el.visible or el.disabled: continue   <span class="cmt"># skip what a user couldn't use</span>
+        if el.tag in ("textarea", "select"):     out.append(el)
+        elif el.widget_type == "mui_select":      out.append(el)
+        elif el.tag == "input" and (el.element_type or "text") not in _SKIP_INPUT_TYPES:
+            out.append(el)
+    return out</code></pre>
+<p>One subtlety: <code>(el.element_type or "text")</code>. A plain <code>&lt;input&gt;</code> with no <code>type</code>
+attribute has <code>element_type is None</code>; the <code>or "text"</code> substitutes the HTML default ("text") so it
+isn't accidentally skipped. Buttons/hidden/file inputs are in <code>_SKIP_INPUT_TYPES</code> and fall through, returning
+only the genuinely fillable fields.</p>
+
+<div class="page-break"></div>
+
+<h3>fill_form &amp; the dispatcher</h3>
+<p class="filepath">src/agent/executor.py</p>
+<pre><code>async def fill_form(self, values, elements):
+    by_sel = {e.selector: e for e in elements}     <span class="cmt"># dict comprehension: selector -&gt; Element</span>
+    results = []
+    for selector, value in values.items():
+        results.append(await self._fill_one(by_sel.get(selector), selector, value))
+    return results</code></pre>
+<p><code>by_sel</code> is a <strong>dict comprehension</strong> — it inverts the element list into a lookup table keyed by
+selector. <code>by_sel.get(selector)</code> returns the matching <code>Element</code> or <code>None</code> (the
+<code>.get</code> avoids a <code>KeyError</code> if the LLM ever returns a selector we don't recognize).
+<code>_fill_one</code> then branches on that element's shape:</p>
+<pre><code>if   element.widget_type == "mui_select":              await self._mui_select(...)
+elif element.tag == "select":                          await self._select(...)
+elif input checkbox/radio:                             await self.page.check(...)
+elif date field:                                       fill, then press Escape
+else:                                                  await self.page.fill(...)</code></pre>
+<p>The whole body is inside <code>try/except</code>; either path returns an <code>ActionResult</code> (ok / not ok with a
+truncated <code>detail</code>). <strong>Failures become data, not crashes</strong> — that's why one bad field never aborts
+the run, and why your FILLS log shows a row per field regardless.</p>
+
+<h3>_mui_select — locator mechanics up close</h3>
+<pre><code>await self.page.click(selector)                              <span class="cmt"># open popup</span>
+await self.page.wait_for_selector("[role='listbox']", state="visible")
+options = self.page.locator("[role='option']")              <span class="cmt"># lazy recipe</span>
+count = await options.count()
+candidates = []
+for i in range(count):
+    opt = options.nth(i)                                     <span class="cmt"># i-th match, found fresh</span>
+    text = (await opt.inner_text()).strip()
+    disabled = (await opt.get_attribute("aria-disabled")) == "true"
+    candidates.append((i, text, disabled))</code></pre>
+<p>Each iteration builds a <strong>tuple</strong> <code>(index, text, disabled)</code> and collects them in a list — a
+plain, inspectable snapshot of the menu. Selection is then two passes: exact non-placeholder match first, else first real
+option. After clicking, it waits for the listbox to hide <em>and</em> the <code>.MuiBackdrop-root</code> to disappear —
+the backdrop is the invisible overlay that, left alive, swallowed your next click.</p>
+<div class="gotcha">
+<strong>Why a tuple, not a class?</strong> It's a throwaway grouping used three lines later. A tuple is the lightest way
+to carry "these three values travel together." Unpacking it reads naturally: <code>for i, text, disabled in candidates</code>.
+</div>
+
+<h3>find_submit — priority via early return</h3>
+<pre><code>clickable = [e for e in elements if _is_clickable(e)]   <span class="cmt"># list comprehension = filter</span>
+
+for e in clickable:
+    if e.in_form and e.element_type == "submit": return e     <span class="cmt"># 1 strongest</span>
+for e in clickable:
+    if e.in_form and _label_matches_submit(e):   return e     <span class="cmt"># 2</span>
+in_form_buttons = [e for e in clickable if e.in_form]
+if in_form_buttons:                              return in_form_buttons[-1]  <span class="cmt"># 3 last in form</span>
+for e in clickable:
+    if _label_matches_submit(e):                 return e     <span class="cmt"># 4 anywhere</span>
+return None                                                    <span class="cmt"># 5 refuse to guess</span></code></pre>
+<p>The pattern is "<strong>try strongest rule; <code>return</code> the instant it hits; otherwise fall to the next.</strong>"
+Each rule is a small predicate (<code>_is_clickable</code>, <code>_label_matches_submit</code>) so the priority ladder
+reads top-to-bottom. <code>in_form_buttons[-1]</code> uses Python's negative index — the <em>last</em> button in the form,
+which by convention is the submit. Returning <code>None</code> rather than "first button on page" is the deliberate choice
+that stopped it clicking the header avatar.</p>
+
+<h2>Part E — Safety &amp; observation</h2>
+
+<h3>SafetyGate — cheap check first, LLM only when needed</h3>
+<p class="filepath">src/safety/gate.py</p>
+<pre><code>for word in DESTRUCTIVE:
+    if word in text: return SafetyVerdict(risk="destructive", ...)   <span class="cmt"># 1 free, instant</span>
+for word in AMBIGUOUS:
+    if word in text: return await self._ask_llm(element)             <span class="cmt"># 2 pay for a thought</span>
+return SafetyVerdict(risk="safe", ...)                               <span class="cmt"># 3 default safe</span></code></pre>
+<p>This is a <strong>tiered</strong> design. Obvious dangers ("delete account") are caught by a substring scan — no API
+call, no latency. Only genuinely <em>ambiguous</em> labels cost an LLM round-trip (and that uses <code>SMALL_MODEL</code>,
+the cheap fast model). Everything else is assumed safe. The gate returns a <code>SafetyVerdict</code> object, and the
+Executor refuses to click anything marked <code>destructive</code>. The principle: <strong>spend compute only where the
+cheap check can't decide.</strong></p>
+
+<h3>Observer — closures registered as event listeners</h3>
+<p class="filepath">src/agent/observer.py</p>
+<pre><code>page.on("console", self._on_console)
+page.on("pageerror", self._on_pageerror)
+page.on("response", self._on_response)</code></pre>
+<p><code>page.on(event, handler)</code> registers a callback that Playwright invokes <em>itself</em> whenever that event
+fires — you never call <code>_on_console</code> directly. Because the handlers are <strong>methods bound to
+<code>self</code></strong>, each one can append to <code>self.console_errors</code> etc. — the lists accumulate in the
+background for the whole session. <code>collect_errors</code> later drains and clears those lists (so a second call won't
+re-report the same errors), converting raw strings into typed <code>Finding</code> objects. <code>check_page</code> is the
+one active probe — it runs a CSS count in the browser for invalid/alert markers right now.</p>
+
+<div class="key">
+<strong>The recurring shape of this codebase:</strong> read the world into typed objects (<code>Element</code>,
+<code>InferredContext</code>), make decisions on those objects in plain Python, push effects back to the browser through
+narrow async calls, and record every outcome as a typed result (<code>ActionResult</code>, <code>Finding</code>). Pydantic
+guards every boundary; <code>try/except</code> turns failures into data; <code>async/await</code> keeps the waiting cheap.
+Once you see that shape, every file is a variation on it.
+</div>
+
+</body>
+</html>

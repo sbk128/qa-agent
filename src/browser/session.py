@@ -1,0 +1,127 @@
+"""Thin async wrapper around a single Playwright page for Phase 0.
+
+The real page snapshotter lands in Phase 1. This file exposes just enough
+to open a URL, grab a tiny text summary, and take a screenshot.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+import re
+from typing import Self
+from src.models.element import Element
+from typing import List
+from src.browser.snapshotter import PageSnapshotter
+
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    async_playwright,
+)
+
+
+@dataclass
+class PageSummary:  # Phase 0: Page description to go into LLM prompt.
+    url: str
+    title: str
+    headings: list[str] = field(default_factory=list)
+    text_preview: str = ""
+    
+
+    def to_prompt(self) -> str: # This is the output from the browser that goes into LLM prompt. It is not a full snapshot, just a few key fields.
+        lines = [f"URL: {self.url}", f"Title: {self.title or '(none)'}"]
+        if self.headings:
+            lines.append("Headings: " + " | ".join(self.headings[:5]))
+        if self.text_preview:
+            lines.append(f"Text: {self.text_preview}")
+        return "\n".join(lines)
+
+
+class BrowserSession: # Opens a new browser session.
+    def __init__(self, headless: bool = True) -> None:
+        self._headless = headless
+        self._pw: Playwright | None = None
+        self._browser: Browser | None = None
+        self._context: BrowserContext | None = None
+        self._page: Page | None = None
+
+    async def __aenter__(self) -> Self:
+        self._pw = await async_playwright().start()
+        self._browser = await self._pw.chromium.launch(
+            headless=self._headless,
+            args = ["--window-side=1920,1080", "--window-position=0,0"])
+        self._context = await self._browser.new_context(
+            viewport={"width":1440, "height": 860}
+        )
+        self._page = await self._context.new_page()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._context:
+            await self._context.close()
+        if self._browser:
+            await self._browser.close()
+        if self._pw:
+            await self._pw.stop()
+
+    @property
+    def page(self) -> Page:
+        if self._page is None:
+            raise RuntimeError("BrowserSession not entered")
+        return self._page
+
+    async def goto(self, url: str, *, wait_until: str = "domcontentloaded") -> None:
+        await self.page.goto(url, wait_until=wait_until)
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass # Some paged never go idle 
+        
+    async def screenshot(self, path: str | Path) -> Path:
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        await self.page.screenshot(path=str(out), full_page=True)
+        return out
+
+    async def summary(self, text_chars: int = 500) -> PageSummary:
+        page = self.page
+        title = await page.title()
+
+        try:
+            headings = await page.eval_on_selector_all(
+                "h1, h2",
+                "els => els.slice(0, 10)"
+                ".map(e => (e.innerText || '').trim())"
+                ".filter(Boolean)",
+            )
+        except Exception:
+            headings = []
+
+        try:
+            text = await page.inner_text("body", timeout=5000)
+        except Exception:
+            text = ""
+        text = " ".join(text.split())[:text_chars]
+
+        return PageSummary(
+            url=page.url,
+            title=title,
+            headings=headings,
+            text_preview=text,
+        )
+     
+    def build_context_blob(summary: PageSummary, elements: list[Element]) -> str:
+        field_lines = [
+            f" - {e.tag} {e.semantic_kind} {e.name}"
+            for e in elements if e.visible
+        ][:25]  # Limit to 25 elements for prompt brevity
+        return (
+            summary.to_prompt() + 
+            "\n\nInteractive elements (sample): \n"
+            + "\n".join(field_lines)
+        )
+    
+    async def extract_elements(self) -> list[Element]:
+        return await PageSnapshotter(self.page).extract_elements()  

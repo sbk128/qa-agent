@@ -1,0 +1,184 @@
+# QA Agent — Progress Checklist
+
+Living checklist of build progress. `[x]` done, `[ ]` todo, ← current focus.
+See [`qa_agent_plan_v2.md`](../qa_agent_plan_v2.md) for the original plan.
+
+## Where you are right now
+**The execution pipeline works end-to-end on a real Material UI app, and the whole data-quality
+thread is closed: the test engine now generates genuinely valid, constraint-aware data and the
+happy-path case is ACCEPTED on the OPD bookappointment page (verified 2026-06-19).**
+**Next: Test Engine Step 4 (report pass/fail table + run the engine on every crawled form).**
+
+The original 6-phase plan is done. On top of it, a 4-step "test engine" (LLM-generated test
+cases → execute → judge pass/fail). Steps 1–3 are built and now verified end-to-end on a live
+form; step 4 (report + crawl integration) remains.
+
+### → Do this next
+- **Step 4 — Report + crawl integration. ← current focus.** Add a per-case pass/fail table to the
+  report (the data already exists on each `TestResult.findings`; `build_report` just doesn't print
+  it yet), and run the test engine on every form the crawler finds — not just the seed page.
+- **Note on the `review` mismatches.** After the data fix, edge cases that expect `rejected` often show
+  `accepted` (the form under-validates, or the LLM's `expected` was too strict). These are correctly
+  framed as *review*, not bugs — Step 4 is where they get surfaced for a human to judge. The old high
+  pass rate was partly an illusion: universally-broken data made the form reject everything.
+
+### ✅ Just finished — the data-quality thread (verified 2026-06-19 on /opd/bookappointment)
+- **(A) LLM-blind text fields — DONE.** Snapshotter captures `placeholder` / `pattern` / `max_length`
+  / `min_value` / `max_value` onto `Element`; `country_hint` resolves via a 3-layer fallback
+  (seeded `--locale` → LLM inference → `DEFAULT_COUNTRY`).
+- **(B) Findings name the field — DONE.** `Observer.check_page()` walks each invalid input, resolves a
+  human label + reads the adjacent error text, emits one `Finding` per field. Verified: now reads
+  `Invalid field: Time Slot — Time slot is required` instead of `2 field(s) flagged invalid`.
+- **Native date fill — DONE.** `executor._to_iso_date` normalizes any date format to ISO `YYYY-MM-DD`
+  before filling a native `<input type="date">` (which otherwise raises "Malformed value").
+- **Generator parity (the real root cause) — DONE.** The test engine runs `TestCaseGenerator`, NOT the
+  `DataGenerator` we'd enriched — so the constraint work wasn't reaching the tests. Extracted one shared
+  `describe_fields()` helper (in `generator.py`) that BOTH generators call, and added the constraint /
+  options / ISO-date+min/max instructions to `TestCaseGenerator`'s prompt. The two can't drift again.
+- **MUI subheader filter — DONE.** `MuiListSubheader-root` rows carry `role="option"` but aren't
+  selectable. `_extract_options` (snapshotter) now drops them so the LLM never picks one, and
+  `_mui_select` (executor) treats them as disabled. This fixed the submit-click `error`s (picking a
+  header left the dropdown open, and its backdrop blocked the submit button).
+- **Result:** happy path fills a future date + real dropdown values (e.g. Time Slot `09:00 - 09:30 AM`)
+  and is `accepted`. No more `error` outcomes.
+
+### Reference docs (written for catching up)
+- `docs/QA_Agent_Walkthrough.pdf` — what each stage does, traced through the waitlist example.
+- `docs/QA_Agent_Code_DeepDive.pdf` — how the code works (async/await, handles vs locators, the
+  JS bridge, Pydantic, the LLM call). Source HTML + `scripts/html_to_pdf.py` alongside.
+
+---
+
+## Phase 0 — Setup ✅
+- [x] Repo scaffold, `pyproject.toml`, uv env
+- [x] LLM provider abstraction + `GroqProvider` (retry, JSON mode, backoff)
+- [x] `BrowserSession` (open / screenshot / summary)
+- [x] Single-node LangGraph + `main.py` CLI
+
+## Phase 1 — Page Understanding ✅ (core)
+- [x] `Element` Pydantic model
+- [x] Element extraction (input / button / a / select / textarea)
+- [x] Accessible name resolver (aria-label → `<label>` → placeholder → text)
+- [x] Selector picking with uniqueness check + positional fallback
+- [x] `visible` / `disabled` detection
+- [x] `semantic_kind` — Layer 1 `type` → Layer 2 `autocomplete` → Layer 3 keywords → `unknown`
+- [x] `InferredContext` (one LLM call → language / country / currency / domain / app_type)
+- [x] `PageSnapshotter` refactor (snapshot logic out of `session.py`)
+- [x] Tested on 5+ varied sites
+
+Added during real-app hardening:
+- [x] `widget_type` (`native` / `mui_select`) — detects MUI Selects via `role="combobox"` / `aria-haspopup="listbox"`
+- [x] `in_form` flag (`el.closest('form')`) — powers `find_submit` priority
+- [x] `options` — real dropdown choices, read by `_extract_options` (native `<select>` directly; MUI Select by opening the popup)
+- [x] MUI label fix — `.MuiFormControl-root` walk-up so name = field label, not current value
+- [x] `_looks_autogenerated` rejects React `useId` ids (`:r5l:` etc.)
+
+Constraint capture (was weak-spot A — now DONE):
+- [x] **Capture input constraints (`pattern`, `maxlength`, `min`/`max`, `placeholder`) → `Element`.** Read in `extract_elements`; fed to both generators via the shared `describe_fields()` helper. Fixed US-phone junk and the past-date / min-violation on the OPD date field.
+- [ ] Naming fixes: submit-button `value`, `<select>` labels, id-derived names
+- [ ] Compression strategy (keep snapshot under ~5k tokens)
+- [ ] Shadow DOM / iframes
+
+## Phase 2 — Safety Gate ✅ (core)
+- [x] `SafetyVerdict` model + DESTRUCTIVE / AMBIGUOUS pattern lists
+- [x] Layered classifier: rules → ambiguous keywords → small-LLM judge → default safe
+- [x] Validated on isolation tests + live pages
+
+Deferred:
+- [ ] DOM-signal layer (read `title`, `data-confirm`, surrounding warning text — fixes icon-only delete blind spot)
+- [ ] Domain allowlist enforcement
+- [ ] Policy enforcement (block / confirm / allow integration)
+
+## Phase 3 — Data Generation ✅ (core)
+- [x] `FormFill` model
+- [x] `DataGenerator.happy_path` — one LLM call per form, locale-aware
+- [x] `edge_cases()` static library (`UNIVERSAL` + `KIND_SPECIFIC` by `semantic_kind`)
+- [x] `fillable()` helper — now widened to include selects + checkboxes + radios
+
+## Phase 4 — Core Agent Loop ✅
+- [x] `ActionResult` model
+- [x] `Executor` — `fill_form` + safety-gated `click`
+- [x] `find_submit` helper — priority ladder: `type=submit` in form → label-match in form → last in-form button → label-match anywhere → give up (never clicks a stray header button)
+- [x] `Observer` — passive listeners (console / pageerror / 4xx-5xx network) + active DOM check (validation)
+- [x] `Finding` model + buffer-drain fix
+- [x] `AgentState`
+- [x] LangGraph wiring: `snapshot → infer_context → plan → execute → observe → END`
+
+## Phase 5 — Autonomous Navigation ✅ (core)
+- [x] **Sub-step 1:** `decide` node + conditional loopback edge + reducers (`operator.add`) so findings/actions accumulate + `max_iterations` cap + `visited_urls` tracking
+- [x] **Sub-step 2:** Global **frontier** — cross-page memory of unvisited links; agent now explores beyond dead-ends
+
+Deferred:
+- [ ] Sub-step 3: State hashing (same-page-different-URL dedup, e.g. `#fragments`)
+- [ ] Sub-step 4: Dead-end recovery (close modals, escape stuck pages)
+- [ ] Sub-step 5: Prioritization (which link first) + smarter limits
+
+## Phase 6 — Reporting ✅ (core)
+- [x] `build_report` (Markdown) + `write_report` (Markdown + JSON to timestamped `reports/run-*/`)
+- [x] Dedup (collapse identical findings, count `×N`)
+- [x] Severity sorting (critical → info)
+- [x] Coverage map (visited URLs)
+
+Deferred:
+- [ ] Scope filtering (drop third-party / out-of-scope noise like doubleclick)
+- [ ] HTML report (Jinja2)
+
+---
+
+## Test Engine (the LLM-driven test-case sub-system)
+
+The "LLM generates test cases, runs them, judges pass/fail" build on top of the 6 phases.
+
+- [x] **Step 1 — TestCase model + Generator** → `src/models/testcase.py`, `src/agent/testgen.py`, `scripts/show_testcases.py`
+      - LLM produces a suite of cases (happy / edge / scenario), each with data + expected outcome + rationale.
+      - Verified on demoqa practice form: generated 10 diverse cases.
+- [x] **Step 2 — Widget-aware Executor** → `src/agent/executor.py` (`_fill_one` dispatcher + `_select` + `_mui_select`)
+      - Dispatches by control type: MUI Select → `_mui_select`, `<select>` → `select_option`, checkbox/radio → `check`, date → `fill + Escape`, else → `fill`.
+      - `_mui_select`: open popup → skip placeholders → exact-match option → click → wait for listbox + `.MuiBackdrop-root` to clear.
+      - Verified on practice form (invalid fields 5 → 2) and on the hospital MUI dropdowns.
+- [x] **Step 3 — Runner + Judge** → `src/agent/runner.py` (`TestRunner.run_one` / `run_suite` / `_judge`)
+      - Per case: reload form → fill data → click submit → observe → `_judge` maps to `error` / `rejected` / `accepted` → compare vs `expected` → `passed`.
+      - Mismatches framed as review findings, not definitive bugs.
+      - **Verified end-to-end 2026-06-19** via `scripts/show_agent.py` on /opd/bookappointment: happy
+        path `accepted`, edge mismatches surfaced as `review`. (Runs inside the graph's execute node;
+        no separate `show_run.py` demo needed.)
+- [ ] ← **Step 4 — Report + crawl integration** (NEXT)
+      - Pass/fail table per case in the report — the data is already on each `TestResult` (incl.
+        per-case `findings`); `build_report` just needs to render it.
+      - Run the test engine on every form the crawler finds, not only the seed page.
+
+---
+
+## Real-app hardening (the last multi-day effort) ✅
+Made the Phase 4 pipeline actually drive a real Material UI SPA — the hospital management app
+(`localhost:5173`, OPD filter page + waitlist form). Verified working end-to-end.
+- [x] Detect MUI Selects (`role="combobox"` / `aria-haspopup="listbox"`) — they are `<div>`s, not `<select>`
+- [x] `_extract_options` reads real dropdown choices into `Element.options`
+- [x] Feed `options` to `DataGenerator` so the LLM picks real values (no more hallucinated "Dr. Rachel Kim")
+- [x] `_mui_select` dropdown dance + placeholder skip + backdrop wait (fixed "Apply Filters didn't fire")
+- [x] `find_submit` + `in_form` (fixed clicking the header avatar instead of "Add to Waiting List")
+- [x] MUI label resolution + React `useId` selector handling + 1440×860 viewport for the M2 Air
+
+### Two weak spots — both now CLOSED (verified 2026-06-19)
+- [x] **(A) LLM-blind text fields.** Captured constraints + min/max into `Element`; shared `describe_fields()` feeds both generators; `country_hint` resolves via 3-layer fallback. Plus: native-date ISO normalizer + MUI subheader filter (surfaced while verifying). Happy path now `accepted`.
+- [x] **(B) Findings don't name the field.** `check_page()` now names each invalid field and reads its error text (e.g. `Invalid field: Time Slot — Time slot is required`).
+
+### Known limitations of the test engine
+- Custom JS widgets (react-select-style) — `fill` is best-effort, may not commit
+- LLM can't emit huge literals (`'a".repeat(1000)'` artifact) — inject from `edge_cases()` static lib
+- `expected` is the LLM's guess, not a spec — Judge must frame mismatches as "review," not "BUG"
+- App-specific validation rules (demoqa 10-digit phone) — capture HTML constraints (deferred Phase 1)
+- Multi-step journey testing (Tier 3) — likely needs human-seeded journey templates; not autonomous
+
+---
+
+## Scripts at a glance
+| Script | What it demonstrates |
+|---|---|
+| `scripts/show_elements.py` | Phase 1 — element extraction + selectors + `semantic_kind` |
+| `scripts/show_context.py`  | Phase 1 — page-level `InferredContext` via LLM |
+| `scripts/show_safety.py`   | Phase 2 — safety gate (fakes mode + `--url` live mode) |
+| `scripts/show_data.py`     | Phase 3 — happy-path data generation + edge-case list |
+| `scripts/show_execute.py`  | Phase 4 — full pipeline on one page (fill + submit + observe), headed |
+| `scripts/show_agent.py`    | Phases 5–6 — autonomous multi-page crawl, writes a report |
+| `scripts/show_testcases.py`| Test engine step 1 — LLM-generated test suite (prints, no execution yet) |

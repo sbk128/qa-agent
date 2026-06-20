@@ -1,0 +1,31 @@
+# Example target config. Copy and edit per target app.
+target:
+  url: "https://example.com"
+
+auth:
+  mode: "none"  # none | storage_state | credentials
+  storage_state_path: null
+  # login_url: ""
+  # username: ""
+  # password: ""
+
+scope:
+  allowed_domains: ["example.com"]
+  max_depth: 5
+  max_iterations: 50
+  max_runtime_minutes: 15
+
+safety:
+  destructive_action_policy: "block"  # block | confirm | allow
+  blocked_url_patterns: ["/logout", "/billing/charge"]
+  blocked_button_text_patterns: ["delete account", "pay now"]
+
+testing:
+  modes: ["happy", "edges"]
+  edge_case_intensity: "medium"  # low | medium | high
+
+output:
+  report_dir: "./reports"
+  formats: ["markdown", "html", "json"]
+  screenshots: true
+  trace: true
