@@ -13,3 +13,7 @@ screenshots/
 *.sqlite
 *.db
 .DS_Store
+
+# Saved auth session (contains a live SSO/JWT token — do not commit)
+auth.json
+*.auth.json

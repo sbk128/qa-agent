@@ -1,13 +1,16 @@
+# Ordered headline-nasties-first: anything that slices a prefix of this list
+# (e.g. the test-case injector) gets the high-signal security/length values, not
+# just empty/whitespace.
 UNIVERSAL: list[str] = [
-    "",                              # empty
-    "   ",                           # whitespace only
     "a" * 10000,                     # absurdly long
-    "🔥😀",                           # emoji
-    "العربية",                       # right-to-left script
     "<script>alert(1)</script>",     # XSS
     "' OR '1'='1",                   # SQL injection
     "{{7*7}}",                       # template injection
+    "🔥😀",                           # emoji
+    "العربية",                       # right-to-left script
     "\n\t",                          # control whitespace
+    "",                              # empty
+    "   ",                           # whitespace only
 ]
 
 # Extra nasties that only make sense for a specific kind of field

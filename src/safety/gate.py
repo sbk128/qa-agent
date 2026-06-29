@@ -3,12 +3,27 @@ from src.models.element import Element
 from src.models.safety import SafetyVerdict
 from src.safety.patterns import DESTRUCTIVE, AMBIGUOUS
 
+# Buttons that START with one of these are data-entry/create actions — safe to click
+# even if the label contains a "destructive" word. e.g. "Add Payment" / "Save Charge"
+# are recording data, not the irreversible "Pay now" / "Charge card" the rules target.
+_SAFE_CREATE_PREFIXES = ("add ", "create ", "new ", "save ", "register ", "update ", "edit ")
+
 class SafetyGate:
-    def __init__(self, llm: LLMProvider) -> None:
+    def __init__(self, llm: LLMProvider, allow_all: bool = False) -> None:
         self.llm = llm
+        # Sandbox mode: skip the destructive block entirely. For dev/test targets where
+        # exercising every action (incl. financial submits like "Submit Transaction") is
+        # the point. Off by default — safety stays on for unknown/prod sites.
+        self.allow_all = allow_all
 
     async def evaluate(self, element: Element) -> SafetyVerdict:
-        text = (element.name or "").lower()
+        if self.allow_all:
+            return SafetyVerdict(risk="safe", reason="sandbox mode (--allow-all): gate disabled")
+
+        text = (element.name or "").lower().strip()
+
+        if text.startswith(_SAFE_CREATE_PREFIXES):
+            return SafetyVerdict(risk="safe", reason="create/data-entry action")
 
         for word in DESTRUCTIVE:
             if word in text:

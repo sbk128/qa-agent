@@ -40,8 +40,11 @@ class PageSummary:  # Phase 0: Page description to go into LLM prompt.
 
 
 class BrowserSession: # Opens a new browser session.
-    def __init__(self, headless: bool = True) -> None:
+    def __init__(self, headless: bool = True, storage_state: str | Path | None = None) -> None:
         self._headless = headless
+        # Path to a saved Playwright storage_state (cookies + localStorage, incl. the
+        # SSO JWT). When the file exists, the context starts already authenticated.
+        self._storage_state = storage_state
         self._pw: Playwright | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
@@ -51,12 +54,28 @@ class BrowserSession: # Opens a new browser session.
         self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(
             headless=self._headless,
-            args = ["--window-side=1920,1080", "--window-position=0,0"])
-        self._context = await self._browser.new_context(
-            viewport={"width":1440, "height": 860}
-        )
+            # The flag is --window-size (the old "--window-side" was a typo, so
+            # Chromium silently ignored it). Pin the window to the top-left so it
+            # doesn't get centered and spill off both edges of the screen.
+            args=["--window-size=1280,860", "--window-position=0,0"])
+
+        # Viewport = the page area. A 13.6" MacBook Air is ~1470x956 points; keep
+        # the page well inside that so the whole window (menu bar + browser chrome
+        # + page) is visible at once instead of running off-screen.
+        context_kwargs = {"viewport": {"width": 1280, "height": 740}}
+        if self._storage_state and Path(self._storage_state).exists():
+            context_kwargs["storage_state"] = str(self._storage_state)
+        self._context = await self._browser.new_context(**context_kwargs)
+
         self._page = await self._context.new_page()
         return self
+
+    async def save_storage_state(self, path: str | Path) -> Path:
+        """Persist cookies + localStorage (the authenticated session) to disk."""
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        await self._context.storage_state(path=str(out))
+        return out
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         if self._context:
@@ -72,12 +91,13 @@ class BrowserSession: # Opens a new browser session.
             raise RuntimeError("BrowserSession not entered")
         return self._page
 
-    async def goto(self, url: str, *, wait_until: str = "domcontentloaded") -> None:
-        await self.page.goto(url, wait_until=wait_until)
+    async def goto(self, url: str, *, wait_until: str = "domcontentloaded",
+                   timeout: float | None = None) -> None:
+        await self.page.goto(url, wait_until=wait_until, timeout=timeout)
         try:
             await self.page.wait_for_load_state("networkidle", timeout=5000)
         except Exception:
-            pass # Some paged never go idle 
+            pass # Some paged never go idle
         
     async def screenshot(self, path: str | Path) -> Path:
         out = Path(path)

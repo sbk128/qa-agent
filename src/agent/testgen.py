@@ -3,6 +3,62 @@ from src.models.testcase import TestSuite, TestCase
 from src.models.element import Element
 from src.models.context import InferredContext
 from src.data.generator import fillable, describe_fields
+from src.data.edge_cases import UNIVERSAL, KIND_SPECIFIC
+
+# Injecting a nasty literal only makes sense for free-text fields — dropdowns /
+# radios / checkboxes auto-repair to a valid choice, so junk there never sticks.
+def _is_free_text(f: Element) -> bool:
+    if f.widget_type == "mui_select":
+        return False
+    if f.tag == "select":
+        return False
+    if f.element_type in ("radio", "checkbox"):
+        return False
+    return True
+
+
+def _label_for(value: str) -> str:
+    if value == "":
+        return "empty"
+    if value.strip() == "":
+        return "whitespace"
+    if len(value) > 40:
+        return f"{len(value)}-char string"
+    return value
+
+
+_MAX_PER_FIELD = 6   # cap injected cases per field so big forms don't explode
+
+
+def build_edge_cases(fields, baseline: dict[str, str]) -> list[TestCase]:
+    """Genuinely-invalid cases built from the static edge_cases library.
+
+    Take the valid happy-path `baseline` and corrupt EXACTLY ONE field with a real
+    nasty value (XSS, SQLi, a 10k-char string, a bad email/date…). One bad field at
+    a time keeps any rejection attributable. `expected="rejected"` is a lightweight
+    oracle: a genuinely-bad value SHOULD be rejected — if the form accepts it, that's
+    a real under-validation finding.
+    """
+    cases: list[TestCase] = []
+    for f in fields:
+        if not _is_free_text(f):
+            continue
+        # Field-specific nasties first (most relevant), then the headline universal
+        # ones — so each field gets a diverse, targeted set within the cap.
+        bad_values = (KIND_SPECIFIC.get(f.semantic_kind, []) + UNIVERSAL)[:_MAX_PER_FIELD]
+        for bad in bad_values:
+            data = dict(baseline)
+            data[f.selector] = bad
+            cases.append(TestCase(
+                name=f"Bad {f.name}: {_label_for(bad)}",
+                category="edge",
+                description=f"Inject {_label_for(bad)!r} into '{f.name}', everything else valid.",
+                field_values=data,
+                expected="rejected",
+                rationale="Genuinely-invalid input should be rejected; acceptance = under-validation.",
+            ))
+    return cases
+
 
 class TestCaseGenerator:
     def __init__(self, llm: LLMProvider) -> None:
@@ -40,7 +96,17 @@ class TestCaseGenerator:
             "Return JSON matching the schema."
         )
         suite = await self.llm.structured(prompt, TestSuite)
-        return suite.cases
+        cases = suite.cases
+
+        # Add genuinely-nasty edge cases from the static library, injected one bad
+        # field at a time onto the LLM's valid happy-path baseline. The LLM is good
+        # at *which* scenarios to try but weak at emitting *genuinely* bad values
+        # (it truncates the 10k-char string, writes polite fakes) — so we supply
+        # those deterministically instead of trusting it.
+        happy = next((c for c in cases if c.category == "happy" and c.field_values), None)
+        if happy:
+            cases = cases + build_edge_cases(fields, happy.field_values)
+        return cases
     
         
         

@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from playwright.async_api import Page
 from src.models.element import Element
@@ -97,7 +98,11 @@ class Executor:
             elif element and element.tag == "select":
                 await self._select(selector, value)
 
-            elif element and element.tag == "input" and element.element_type in ("checkbox", "radio"):
+            elif element and element.element_type == "radio":
+                # A radio group is one field: pick the one option matching `value`.
+                await self._radio(selector, value)
+
+            elif element and element.tag == "input" and element.element_type == "checkbox":
                 # any "truthy" value means: tick it
                 if value.strip().lower() not in ("", "false", "no", "0", "unchecked"):
                     await self.page.check(selector, timeout=5000)
@@ -126,6 +131,35 @@ class Executor:
                 continue
         raise Exception(f"no selectable option for {selector}")
 
+    async def _radio(self, group_selector: str, value: str) -> None:
+        # group_selector looks like input[name="gender"]; value is the chosen option label.
+        m = re.search(r'name="([^"]+)"', group_selector)
+        name = m.group(1) if m else None
+        v = value.strip().lower()
+        if name:
+            base = f'input[type="radio"][name="{name}"]'
+            # 1. match by the radio's visible label text (most reliable)
+            labels = self.page.locator(f"label:has({base})")
+            for i in range(await labels.count()):
+                lbl = labels.nth(i)
+                if (await lbl.inner_text()).strip().lower() == v:
+                    await lbl.click(timeout=5000)
+                    return
+            # 2. match by the radio's value attribute
+            try:
+                await self.page.check(f'{base}[value="{value}"]', timeout=2500)
+                return
+            except Exception:
+                pass
+            # 3. fallback: first option in the group
+            try:
+                await self.page.locator(base).first.check(timeout=2500)
+                return
+            except Exception:
+                pass
+        # last resort: whatever selector we were handed
+        await self.page.locator(group_selector).first.check(timeout=2500)
+
     async def click(self, element: Element) -> ActionResult:
         verdict = await self.gate.evaluate(element)
         if verdict.risk == "destructive":
@@ -138,13 +172,6 @@ class Executor:
 
         try:
             await self.page.click(element.selector, timeout=5000)
-            await self.page.wait_for_load_state("networkidle", timeout=5000)
-            return ActionResult(
-                action="click",
-                selector=element.selector,
-                ok=True,
-                detail=verdict.risk
-            )
         except Exception as e:
             return ActionResult(
                 action="click",
@@ -152,7 +179,22 @@ class Executor:
                 ok=False,
                 detail=str(e)[:200]
             )
-        
+
+        # Settling is best-effort: SPAs (e.g. a Vite dev server with an HMR socket)
+        # often never reach "networkidle". A timeout here does NOT mean the click
+        # failed, so don't let it fail the action — mirror session.goto's handling.
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
+
+        return ActionResult(
+            action="click",
+            selector=element.selector,
+            ok=True,
+            detail=verdict.risk
+        )
+
     async def _mui_select(self, selector: str, value: str) -> None:
         # Click trigger to open the popup
         await self.page.click(selector, timeout=5000)

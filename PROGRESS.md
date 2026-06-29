@@ -14,13 +14,109 @@ cases → execute → judge pass/fail). Steps 1–3 are built and now verified e
 form; step 4 (report + crawl integration) remains.
 
 ### → Do this next
-- **Step 4 — Report + crawl integration. ← current focus.** Add a per-case pass/fail table to the
-  report (the data already exists on each `TestResult.findings`; `build_report` just doesn't print
-  it yet), and run the test engine on every form the crawler finds — not just the seed page.
-- **Note on the `review` mismatches.** After the data fix, edge cases that expect `rejected` often show
-  `accepted` (the form under-validates, or the LLM's `expected` was too strict). These are correctly
-  framed as *review*, not bugs — Step 4 is where they get surfaced for a human to judge. The old high
-  pass rate was partly an illusion: universally-broken data made the form reject everything.
+- **Session 2026-06-27/28 — trustworthiness + robustness + coverage.** A run of fixes, all verified
+  by re-running on the live app:
+  - **Report fully redesigned (`reporting/report.py`).** Leads with what to act on, shows the actual
+    data typed per case, drops the "Actions taken: 0" noise, demotes the URL dump. Flagged cases are
+    split by *confidence*: **"⚠ Worth checking"** (the app gave hard evidence — a 4xx/5xx or JS crash,
+    via `_has_hard_evidence`) vs **"🤔 Maybe"** (form just didn't match the LLM's guess, no error). This
+    stops the report crying wolf — e.g. demoqa's permissive forms land in "maybe", real `422`/`404`s
+    rise to "worth checking". GUI unaffected (reads `report.json`, which is unchanged).
+  - **Dropdown mis-fill FIXED — the big one (`snapshotter.py`).** MUI Selects were getting fragile
+    positional selectors (`div > div > div…`) → mis-fills → false rejects (even happy paths). Root
+    cause: `_AUTOGEN_ID` discarded *good* stable ids like `mui-component-select-PaymentMethod` because
+    the regex matched any `[-_]<5+ alnum>$` suffix. Now it only rejects suffixes that **contain a
+    digit** (hashes/counters), keeping meaningful word-suffix ids. Verified live: report now shows
+    `mui-component-select-Gender="Male"` etc., readable + stable. Diagnosed via new
+    `scripts/inspect_dropdowns.py`.
+  - **Two snapshot crash fixes (`snapshotter.py`).** (a) `#357Fu`-style ids (id starting with a digit)
+    made an invalid CSS selector → use the `[id="…"]` attribute form for non-letter-start ids.
+    (b) Elements detaching mid-snapshot (a modal's Close button) raised "not attached to DOM" → per-
+    element `try/except PlaywrightError: continue` so one stale handle can't abort the whole snapshot.
+  - **Hang guard + progress logging.** A run froze silently inside one test case. Added (1) breadcrumb
+    logging at every graph node (`agent_graph.py` `_log`) + per-case + fill/submit (`runner.py`) so a
+    hang now NAMES where it is; (2) a hard **120s per-case budget** (`asyncio.wait_for` in `run_suite`)
+    → a stuck fill/submit is recorded as `error` and the run continues instead of hanging forever.
+    Localised via new `scripts/time_snapshot.py`. NOTE: the original hang was non-deterministic and
+    didn't reproduce — root cause still unknown, but it's now self-healing + will be logged if it recurs.
+  - **Multi-page coverage via routes seed (GUI).** This SPA navigates by buttons, so the link crawler
+    only ever reached the seed page. New "Also test these pages" box (`main_window.py`) → `RunConfig.routes`
+    → seeds `frontier` in `workers.py`. Each listed URL is visited + tested (capped by Max pages).
+    Addresses gap #2 pragmatically (no fragile button-crawling).
+  - **Sandbox `--allow-all` now ON by default in the GUI** (`main_window.py` `setChecked(True)`) — the
+    usual target is a throwaway dev box; untick before pointing at real data.
+  - **Viewport fixed for the 13" M2 Air** (`session.py`): `--window-side` typo → `--window-size`;
+    viewport 1440×860 → 1280×740 + pinned top-left, so the headed window stops spilling off-screen.
+- **Network-aware judge — BUILT + VERIFIED (2026-06-26).** `_judge` (`runner.py`) now reads the
+  Observer's 4xx/5xx `network_error` findings (new `_network_statuses` helper), not just client-side
+  validation: 4xx → `rejected`, 5xx → `error`. Closes gap #1(c) — backend rejections were masked as a
+  false `accepted`. Verified by replaying the `run-20260626-175548` findings through the new judge: 3
+  false-`accepted` cases (a real `422` on /transactions, two `404`s on /cash-in/opd) flip to correct
+  `rejected` → 22/44 → **25/44**, no regressions, no happy-path broken. ROUGH EDGE (logged, not fixed):
+  all 4xx treated alike, but a `404` is route-not-found (arguably `error`) vs `400/409/422` = validation
+  reject; and it still counts unrelated 4xx noise (favicon/analytics) — later, scope to the submit request.
+- **Modal-triggered forms — BUILT (2026-06-26), pending end-to-end test.** `src/agent/modal_tester.py`
+  (`ModalTester`), wired into `execute_node` so it runs on every crawled page. Discovers launchers by
+  verb-prefix (`Add/New/Create/Edit`) across tabs → opens each → snapshots scoped to the
+  `[role="dialog"]` (via `extract_elements(root=...)`) → generates + runs a suite (reload, re-open,
+  fill inside the dialog, submit, observe, judge) → closes (Cancel/Escape). Results tagged `url#Label`
+  so the report groups one section per modal. Safety gate updated: create verbs (`Add/Save/…`) are
+  safe, so `Add Payment` isn't blocked by the `"pay"` rule (destructive verbs still blocked).
+  Mechanism proven via probe on IPD Billing (modal opened, 5 fields extracted, submit `ADD PAYMENT`).
+  KNOWN GAPS: icon-only launchers (FAB `+` has no text) aren't detected; `ADD CHARGE` (inline row,
+  not a dialog) is correctly skipped. **Run a full crawl on the accounting module to verify.**
+- **Sandbox `--allow-all` flag (2026-06-26).** The accounting cash-in forms submit via `SUBMIT
+  TRANSACTION`, which the safety gate's LLM (correctly) flags destructive → click skipped → all cases
+  `error` (this caused the 4/31 run). New opt-in `--allow-all` (CLI) / "Sandbox" checkbox (GUI) sets
+  `SafetyGate(allow_all=True)` → gate returns `safe` for everything. Off by default; for dev/test
+  targets only. Threads gate → `build_agent_graph` → show_agent/`RunConfig`.
+- **VERIFIED end-to-end on the accounting module (2026-06-26, with `--allow-all`).** Modal tester
+  found + tested both payment modals (`…#ADD PATIENT PAYMENT`, `…#ADD PROFESSIONAL PAYMENT`) — happy
+  paths `accepted`, required-field rejections caught. With the sandbox flag on, the cash-in *page*
+  forms (`opd`, `general`) flipped from all-`error` to real results. Overall 22/44; `review` rows =
+  real under-validation candidates (forms accept overlong / special-char / invalid input).
+- KNOWN REMAINING: bare `/cash-in/ipd_bill` (no `?ipdnumber=`) is all-`error` — a lookup form with no
+  patient loaded (submitting navigates/fails), not a gate block. Degenerate page; the real flow is the
+  param'd page + its modals. Icon-only `+` FAB launchers still undetected (no text).
+- **Dashboard / read-only verification (planned, after modals).** Pages like the Financial Dashboard
+  and Transactions list have nothing to fill+submit — testing them is a different *mode*: click filters
+  (Last 7/30/90 days, date range, Apply) and assert the data changes + no console/network errors +
+  flag empty states (`No Data Available`, `₹0`). Correctness of the numbers needs an oracle the agent
+  doesn't have, so scope = "loads, reacts, doesn't error," not value-checking.
+- **Step 4 — Report + crawl integration (still pending).** Per-case pass/fail table in the report
+  (data already on each `TestResult.findings`); run the engine on every crawled form, not just the seed.
+- **Note on the `review` mismatches.** Edge cases that expect `rejected` often show `accepted` (the form
+  under-validates, or the LLM's `expected` was too strict). Framed as *review*, not bugs.
+
+---
+
+## What's lacking — honest gaps (assessed 2026-06-26, for next session)
+Ordered by impact. The engine *drives* real apps well now; the weaknesses are mostly about
+**trustworthiness of results** and **coverage**, not basic mechanics.
+
+1. **Findings aren't trustworthy yet — biggest gap.** A `review` row ("expected rejected, observed
+   accepted") can't distinguish a real bug from noise, because: (a) **no oracle** — `expected` is the
+   LLM's guess, not a spec; (b) **shallow edge data** — the LLM doesn't reliably emit *genuinely*
+   invalid values, and `_mui_select`/radio fills auto-repair bad dropdown choices, so the "bad" input
+   often isn't bad by submit time; (c) ~~**client-side only**~~ **DONE (2026-06-26)** — `_judge` now also
+   reads the Observer's 4xx/5xx network findings, so a backend rejection is no longer masked as a false
+   `accepted` (see worklog up top). → Remaining highest-value fix: inject genuinely-invalid values from
+   the static `edge_cases()` lib instead of trusting the LLM (addresses (b)); (a) no-oracle still open.
+2. **Coverage is shallow** (partly addressed 2026-06-28). The crawler still only follows `<a href>`,
+   but the **routes seed** (GUI "Also test these pages" → `RunConfig.routes` → `frontier`) now lets you
+   hand it the pages this button-driven SPA hides, so multi-page testing works. Still open: button/
+   `[role=link]` auto-nav discovery, multi-step **wizard** walking (patreg = step 1 only), **dashboards
+   / read-only** assertion mode, icon-only `+` FAB launchers.
+3. **No determinism / regression-ability.** Every run regenerates cases via the LLM, so case counts and
+   pass rates wobble; you can't compare runs or catch regressions. → Optional: cache/seed a suite per
+   form (a "saved suite" mode).
+4. ~~**Report & UX leftovers (Step 4).**~~ **DONE 2026-06-27** — report redesigned: shows the data
+   typed per case, drops the always-0 "Actions taken" line, splits flagged cases by confidence
+   (Worth checking vs Maybe). Still open: no HTML report; finding descriptions still sometimes fall
+   back to the generic string.
+5. **Operational.** Slow + token-heavy (reload-per-case, modal re-open-per-case); creates real records
+   with no cleanup (fine on dev DB, but it accumulates); positional selectors still used for radios /
+   some buttons (fragile); the agent itself has ~no automated tests.
 
 ### ✅ Just finished — the data-quality thread (verified 2026-06-19 on /opd/bookappointment)
 - **(A) LLM-blind text fields — DONE.** Snapshotter captures `placeholder` / `pattern` / `max_length`
@@ -41,6 +137,23 @@ form; step 4 (report + crawl integration) remains.
   header left the dropdown open, and its backdrop blocked the submit button).
 - **Result:** happy path fills a future date + real dropdown values (e.g. Time Slot `09:00 - 09:30 AM`)
   and is `accepted`. No more `error` outcomes.
+
+### ✅ Also done — authenticated crawling + crash-resilience (2026-06-24)
+Target moved to the in-dev app at `http://192.168.0.191:8000` (behind a JWT login). It's a dev/test
+copy, so form submits creating real records is fine — no `--no-submit` needed.
+- **Auth capture — `scripts/login.py` (NEW).** Opens a headed browser at the login page and waits for
+  YOU to log in by hand (auto-detects leaving `/login`; Enter is a fallback). Saves the session
+  (cookies + localStorage, incl. the JWT) to `auth.json` via Playwright `storage_state`, and prints a
+  cookie/origin sanity count so an empty capture is obvious. Login is deliberately a SEPARATE script so
+  the test agent never fills/submits the login form itself.
+- **Session reuse.** `BrowserSession(storage_state=...)` starts the context already authenticated.
+  `show_agent.py` auto-loads `auth.json` when it holds a real session (`_has_session` guards against the
+  empty-file trap that silently skipped login before). `auth.json` is git-ignored (live token).
+- **Runner crash-resilience.** `TestRunner._reload` retries the per-case page reload (2× at 60s); if it
+  still fails, that case is recorded as an `error` TestResult instead of the `net::ERR_TIMED_OUT`
+  exception aborting the whole suite. `session.goto` now takes an optional `timeout`.
+- **Note:** the safety gate allows form *submits* by design (only blocks destructive verbs like
+  delete/pay). Fine here since it's a dev DB; revisit if ever pointed at live data.
 
 ### Reference docs (written for catching up)
 - `docs/QA_Agent_Walkthrough.pdf` — what each stage does, traced through the waitlist example.
@@ -169,8 +282,38 @@ Made the Phase 4 pipeline actually drive a real Material UI SPA — the hospital
 - `expected` is the LLM's guess, not a spec — Judge must frame mismatches as "review," not "BUG"
 - App-specific validation rules (demoqa 10-digit phone) — capture HTML constraints (deferred Phase 1)
 - Multi-step journey testing (Tier 3) — likely needs human-seeded journey templates; not autonomous
+- **Big forms can exceed the LLM JSON limit.** Many fields × long positional selectors bloat the
+  test-suite JSON → Groq `json_validate_failed`. Now crash-safe: `plan_node` catches it and skips the
+  page (2026-06-24). Real fix = shorter selectors (see useId fix below) to shrink the payload.
+- **Multi-step wizards (e.g. `/ipd/patreg`).** "Next" is disabled until the form is valid; the agent
+  tests one page, doesn't walk the wizard. If fills fail, every case reports `error`.
+
+### Surfaced + fixed via `/ipd/patreg` (2026-06-24)
+- **`plan_node` resilience** — a failed `testgen.generate` (transient Groq error / oversized JSON) is
+  caught and the page is skipped, instead of `RuntimeError` aborting the whole crawl.
+- **React `useId` selectors (`«r5»`)** — `_looks_autogenerated` now rejects the guillemet `«…»` useId
+  format (it already caught the `:r5:` colon format). Fields fall through to their stable `name`
+  attribute (`input[name="firstName"]`) instead of an unstable per-render id — fixing fills-fail-on-reload
+  and shrinking the LLM payload.
+- **`networkidle` was a false success-gate in `executor.click`** — the click succeeded but the follow-up
+  `wait_for_load_state("networkidle")` timed out (Vite HMR socket never goes idle), which marked the
+  whole click failed → every case `error`. Now the click and the settle-wait are separate: a click
+  failure → `error`, but a networkidle timeout is best-effort (ignored), mirroring `session.goto`.
+- **Result:** `/ipd/patreg` went 0/8 (all `error`) → **2/5**: happy path `accepted`, empty-required
+  correctly `rejected`, 3 `review` (accepts invalid phone / overlong / special chars).
 
 ---
+
+## Desktop GUI (`gui/`) — added 2026-06-25
+A PySide6 (Qt) front-end over the same agent — no behaviour change, it just surfaces it.
+Run with `uv sync --group gui` then `uv run qa-agent-gui`.
+- Reuses `build_agent_graph` / `BrowserSession` / `write_report` directly, so every fix here
+  (auth, networkidle, useId selectors, plan_node resilience) applies automatically.
+- `RunWorker`/`LoginWorker` drive the async agent on a background QThread (private asyncio loop),
+  streaming node-by-node progress to the UI via Qt signals; `astream(stream_mode="updates")`.
+- Config form (url/locale/auth/headless/max-pages), live findings + test-results + coverage,
+  log console, History panel (re-renders past `reports/run-*`), Settings (writes `.env.local`).
+- See `gui/README.md`. Note: "Max pages" overrides `agent_graph.MAX_ITERATIONS` per run.
 
 ## Scripts at a glance
 | Script | What it demonstrates |
@@ -180,5 +323,6 @@ Made the Phase 4 pipeline actually drive a real Material UI SPA — the hospital
 | `scripts/show_safety.py`   | Phase 2 — safety gate (fakes mode + `--url` live mode) |
 | `scripts/show_data.py`     | Phase 3 — happy-path data generation + edge-case list |
 | `scripts/show_execute.py`  | Phase 4 — full pipeline on one page (fill + submit + observe), headed |
-| `scripts/show_agent.py`    | Phases 5–6 — autonomous multi-page crawl, writes a report |
+| `scripts/show_agent.py`    | Phases 5–6 — autonomous multi-page crawl, writes a report (reuses `auth.json` if present) |
 | `scripts/show_testcases.py`| Test engine step 1 — LLM-generated test suite (prints, no execution yet) |
+| `scripts/login.py`         | Capture an authenticated session → `auth.json` (manual login, no test agent involved) |

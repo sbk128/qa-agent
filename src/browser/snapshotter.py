@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import re
-from playwright.async_api import Page
+from playwright.async_api import Page, Error as PlaywrightError
 from src.models.element import Element
 
 class PageSnapshotter:
     """Turns a live Playwright page into a list of structured Elements."""
-    _AUTOGEN_ID = re.compile(r'[_-][a-zA-Z0-9]{5,}$')
+    # A trailing "-<suffix>" / "_<suffix>" that CONTAINS A DIGIT looks machine-
+    # generated (e.g. "field-x7k2p", "mui-32") — unstable, so reject it. A suffix
+    # that's a plain word does NOT (e.g. "...-PaymentMethod", "...-firstName") —
+    # those are meaningful, stable ids we want to KEEP. The old pattern matched any
+    # long suffix and wrongly discarded good MUI ids like the PaymentMethod select.
+    _AUTOGEN_ID = re.compile(r'[_-][a-zA-Z0-9]*\d[a-zA-Z0-9]*$')
     _KINDKEYWORDS: dict[str, tuple[str, ...]] = {
             "password": ("password", "pwd", "pass"),
             "email":    ("email", "e-mail"),
@@ -21,59 +26,112 @@ class PageSnapshotter:
     def __init__(self, page: Page) -> None:
         self._page = page
 
-    async def extract_elements(self) -> list[Element]:
+    async def extract_elements(self, root=None) -> list[Element]:
+        # `root` (an ElementHandle) scopes extraction to a sub-tree — e.g. a modal
+        # dialog — so we snapshot just the fields inside it, not the whole page.
         page = self._page
         results = []
-        handles = await page.query_selector_all("input, button, a, select, textarea, "
+        seen_radio_groups: set[str] = set()
+        scope = root if root is not None else page
+        handles = await scope.query_selector_all("input, button, a, select, textarea, "
                     "[role='button'][aria-haspopup='listbox'], "
                     "[role='combobox']"
                     )
-        
+
         for handle in handles:
-            if await handle.get_attribute("aria-hidden") == "true":
+            # The page can mutate WHILE we snapshot it (a React re-render, a modal
+            # closing) — so a handle grabbed a moment ago may already be detached
+            # from the DOM. Any Playwright call on it then raises "Element is not
+            # attached to the DOM". Catch that per-element and skip just that one,
+            # instead of letting a single stale handle abort the whole snapshot.
+            try:
+                if await handle.get_attribute("aria-hidden") == "true":
+                    continue
+                tag = await handle.evaluate("el => el.tagName.toLowerCase()")
+                element_type = await handle.get_attribute("type")
+                role = await handle.get_attribute("role")
+                aria_haspopup = await handle.get_attribute("aria-haspopup")
+                widget_type = "mui_select" if (
+                    aria_haspopup == "listbox" or role == "combobox"
+                ) else "native"
+
+                # Radios sharing a `name` are ONE logical field (pick one option), not N
+                # separate fields. Emit the group once, with its options, and skip the rest.
+                if tag == "input" and element_type == "radio":
+                    radio_name = await handle.get_attribute("name")
+                    if radio_name:
+                        if radio_name in seen_radio_groups:
+                            continue
+                        seen_radio_groups.add(radio_name)
+                        results.append(await self._build_radio_group(handle, radio_name))
+                        continue
+
+                options = await self._extract_options(handle, tag, widget_type)
+                name = await self._resolve_name(handle, tag)
+                selector = await self._pick_selector(handle, tag)
+                required = await handle.get_attribute("required") is not None
+                visible = await handle.is_visible()
+                disabled = await handle.is_disabled()
+                placeholder = await handle.get_attribute('placeholder')
+                pattern = await handle.get_attribute("pattern")
+                max_length_attr = await handle.get_attribute("maxlength")
+                max_length = int(max_length_attr) if max_length_attr is not None else None
+                kind = await self._infer_kind(handle, tag, element_type, name)
+                in_form = await handle.evaluate("el => !!el.closest('form')")
+                min_value = await handle.get_attribute("min")
+                max_value = await handle.get_attribute("max")
+
+                results.append(Element(
+                    tag=tag,
+                    element_type=element_type,
+                    name=name,
+                    selector=selector,
+                    required=required,
+                    visible=visible,
+                    disabled=disabled,
+                    semantic_kind=kind,
+                    widget_type=widget_type,
+                    in_form=in_form,
+                    options=options,
+                    placeholder=placeholder,
+                    pattern=pattern,
+                    max_length=max_length,
+                    min_value=min_value,
+                    max_value=max_value
+                ))
+            except PlaywrightError:
+                # Stale/detached handle (the element vanished mid-snapshot) — skip
+                # it and keep snapshotting the rest of the page.
                 continue
-            tag = await handle.evaluate("el => el.tagName.toLowerCase()")
-            element_type = await handle.get_attribute("type")
-            role = await handle.get_attribute("role")
-            aria_haspopup = await handle.get_attribute("aria-haspopup")
-            widget_type = "mui_select" if (
-                aria_haspopup == "listbox" or role == "combobox"
-            ) else "native"
-
-            options = await self._extract_options(handle, tag, widget_type)
-            name = await self._resolve_name(handle, tag)
-            selector = await self._pick_selector(handle, tag)
-            required = await handle.get_attribute("required") is not None
-            visible = await handle.is_visible()
-            disabled = await handle.is_disabled()
-            placeholder = await handle.get_attribute('placeholder')
-            pattern = await handle.get_attribute("pattern")
-            max_length_attr = await handle.get_attribute("maxlength")
-            max_length = int(max_length_attr) if max_length_attr is not None else None
-            kind = await self._infer_kind(handle, tag, element_type, name)
-            in_form = await handle.evaluate("el => !!el.closest('form')")
-            min_value = await handle.get_attribute("min")
-            max_value = await handle.get_attribute("max")
-
-            results.append(Element(
-                tag=tag,
-                element_type=element_type,
-                name=name,
-                selector=selector,
-                required=required,
-                visible=visible,
-                disabled=disabled,
-                semantic_kind=kind,
-                widget_type=widget_type,
-                in_form=in_form,
-                options=options,
-                placeholder=placeholder,
-                pattern=pattern,
-                max_length=max_length,
-                min_value=min_value,
-                max_value=max_value
-            ))
         return results
+
+    async def _build_radio_group(self, handle, radio_name: str) -> Element:
+        # One Element for the whole group: name = the group's label (e.g. "Gender"),
+        # options = each radio's visible label (e.g. ["Male", "Female"]). The executor
+        # then picks ONE option, instead of the LLM guessing a value per radio.
+        name = await self._resolve_name(handle, "input")
+        safe = radio_name.replace("\\", "\\\\").replace('"', '\\"')
+        options = await self._page.eval_on_selector_all(
+            f'input[type="radio"][name="{safe}"]',
+            """els => els.map(el => {
+                const lbl = el.closest('label');
+                const t = lbl ? (lbl.innerText || '').trim() : '';
+                return t || el.value || '';
+            }).filter(Boolean)""",
+        )
+        return Element(
+            tag="input",
+            element_type="radio",
+            name=name,
+            selector=f'input[name="{radio_name}"]',   # group base; not meant to be unique
+            required=await handle.get_attribute("required") is not None,
+            visible=await handle.is_visible(),
+            disabled=await handle.is_disabled(),
+            semantic_kind="unknown",
+            widget_type="native",
+            in_form=await handle.evaluate("el => !!el.closest('form')"),
+            options=options or None,
+        )
 
     async def _resolve_name(self, handle, tag:str) -> str:
         mui_label = await handle.evaluate("""el => {
@@ -169,7 +227,10 @@ class PageSnapshotter:
         return "unknown"
     
     def _looks_autogenerated(self, el_id: str) -> bool:
-        if any(c in el_id for c in ":.[](){}#,"):
+        # React useId ids are unstable across renders. They show up as ":r5:" (colon
+        # form, caught by the chars below) or "«r5»" (guillemet form) depending on
+        # the React/MUI build — reject both so we fall through to a stable selector.
+        if any(c in el_id for c in ":.[](){}#,«»"):
             return True
         return bool(self._AUTOGEN_ID.search(el_id))
 
@@ -188,7 +249,14 @@ class PageSnapshotter:
 
         el_id = await handle.get_attribute("id")
         if el_id and not self._looks_autogenerated(el_id):
-            out.append(f'#{el_id}')
+            # A '#id' selector is ILLEGAL CSS if the id doesn't start with a
+            # letter or underscore (e.g. '#357Fu' — an id beginning with a digit),
+            # and query_selector_all throws a SyntaxError that aborts the run.
+            # For those, use the always-valid attribute form '[id="..."]' instead.
+            if re.match(r'^[A-Za-z_]', el_id):
+                out.append(f'#{el_id}')
+            else:
+                out.append(f'[id="{self._escape(el_id)}"]')
 
         name_attr = await handle.get_attribute("name")
         if name_attr:
@@ -245,8 +313,8 @@ class PageSnapshotter:
     
     async def _extract_options(self, handle, tag: str, widget_type:str) -> list[str] | None:
         if tag == "select":
-            return await handle.evaluate("""el => 
-                Array from(el.options)
+            return await handle.evaluate("""el =>
+                Array.from(el.options)
                 .map(o => (o.textContent || '').trim())
                 .filter(Boolean)
             """)
