@@ -61,11 +61,12 @@ def load_run(folder: Path) -> RunReport | None:
     if not json_path.exists():
         return None
     try:
-        data = json.loads(json_path.read_text())
+        # utf-8: reports hold emoji/symbols; the Windows default codec chokes.
+        data = json.loads(json_path.read_text(encoding="utf-8"))
     except Exception:
         return None
     md_path = folder / "report.md"
-    markdown = md_path.read_text() if md_path.exists() else ""
+    markdown = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
     return RunReport(
         path=folder,
         name=folder.name,

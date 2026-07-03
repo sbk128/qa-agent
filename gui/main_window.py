@@ -132,6 +132,14 @@ class MainWindow(QWidget):
 
         form.addWidget(_section("New run"))
 
+        form.addWidget(QLabel("LLM provider"))
+        self.provider_box = QComboBox()
+        # (label shown to user, value passed to get_provider)
+        self.provider_box.addItem("Groq (cloud — Llama 3.3 70B)", "groq")
+        self.provider_box.addItem("Ollama (local — gemma4:e4b)", "ollama")
+        self.provider_box.currentIndexChanged.connect(self._on_provider_changed)
+        form.addWidget(self.provider_box)
+
         form.addWidget(QLabel("Target URL"))
         self.url_edit = QComboBox()
         self.url_edit.setEditable(True)
@@ -323,11 +331,14 @@ class MainWindow(QWidget):
         if not url:
             QMessageBox.warning(self, "Missing URL", "Enter a target URL to crawl.")
             return
-        if not groq_key_present():
+        provider = self.provider_box.currentData()
+        # Only Groq needs an API key; Ollama runs locally with no key.
+        if provider == "groq" and not groq_key_present():
             QMessageBox.warning(
                 self,
                 "No Groq API key",
-                "The agent needs a GROQ_API_KEY. Open Settings to add one.",
+                "The agent needs a GROQ_API_KEY. Open Settings to add one, "
+                "or switch the LLM provider to Ollama (local).",
             )
             self._open_settings()
             return
@@ -345,6 +356,7 @@ class MainWindow(QWidget):
             headless=self.headless_check.isChecked(),
             max_iterations=self.depth_spin.value(),
             allow_all=self.allow_all_check.isChecked(),
+            provider=provider,
         )
 
         # reset views
@@ -439,7 +451,7 @@ class MainWindow(QWidget):
         self.report_path_label.setText(str(md_path))
         self.open_folder_btn.setEnabled(True)
         if md_path.exists():
-            self.report_browser.setMarkdown(md_path.read_text())
+            self.report_browser.setMarkdown(md_path.read_text(encoding="utf-8"))
 
     def _open_report_folder(self) -> None:
         if self._report_folder:
@@ -513,7 +525,21 @@ class MainWindow(QWidget):
         if dlg.exec():
             self._refresh_groq_chip()
 
+    def _on_provider_changed(self) -> None:
+        # The header chip tracks whatever provider is selected.
+        if self.provider_box.currentData() == "ollama":
+            self.groq_chip.setText("Ollama: local (gemma4:e4b)")
+            self.groq_chip.setObjectName("ChipOk")
+            self._restyle(self.groq_chip)
+        else:
+            self._refresh_groq_chip()
+
     def _refresh_groq_chip(self) -> None:
+        # When Ollama is selected the chip is owned by _on_provider_changed.
+        if getattr(self, "provider_box", None) is not None and (
+            self.provider_box.currentData() == "ollama"
+        ):
+            return
         load_env()
         if groq_key_present():
             self.groq_chip.setText("Groq: connected")

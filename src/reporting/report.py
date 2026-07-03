@@ -12,7 +12,10 @@ def write_report(state, out_dir="reports") -> Path:
     run = Path(out_dir) / datetime.now().strftime("run-%Y%m%d-%H%M%S")
     run.mkdir(parents=True, exist_ok=True)
 
-    (run / "report.md").write_text(build_report(state))
+    # encoding="utf-8": the report contains ⚠ 🤔 ✓ ✗ etc., which the Windows
+    # default (cp1252) can't encode — without this, write_text raises
+    # UnicodeEncodeError and the whole run dies at report time.
+    (run / "report.md").write_text(build_report(state), encoding="utf-8")
 
     data = {
         "visited_urls": state.get("visited_urls", []),
@@ -20,7 +23,7 @@ def write_report(state, out_dir="reports") -> Path:
         "findings": [f.model_dump() for f in state.get("findings", [])],
         "test_results": [r.model_dump() for r in state.get("test_results", [])],
     }
-    (run / "report.json").write_text(json.dumps(data, indent=2))
+    (run / "report.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
     return run
 
 

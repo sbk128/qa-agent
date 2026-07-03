@@ -27,7 +27,7 @@ def _label_for(value: str) -> str:
     return value
 
 
-_MAX_PER_FIELD = 6   # cap injected cases per field so big forms don't explode
+_MAX_PER_FIELD = 2   # cap injected cases per field so big forms don't explode
 
 
 def build_edge_cases(fields, baseline: dict[str, str]) -> list[TestCase]:

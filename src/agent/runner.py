@@ -12,6 +12,10 @@ _RELOAD_TIMEOUT_MS = 60000    # LAN dev servers can be slow; default 30s is tigh
 # Hard ceiling per case: one stuck fill/submit can't freeze the whole run. Generous
 # (a slow double-retry reload alone can take ~2 minutes); only a genuine hang trips it.
 _CASE_BUDGET_S = 120
+# Circuit breaker: once the site stops responding (navigation fails/hangs) this many
+# times in a row, stop hammering it — skip the rest of the page's cases instead of
+# burning the full hang-budget on every one. (Public/flaky sites like demoqa die mid-run.)
+_CONSECUTIVE_FAIL_LIMIT = 2
 
 class TestRunner:
     def __init__(self, session: BrowserSession, gate: SafetyGate, observer: Observer) -> None:
@@ -21,7 +25,25 @@ class TestRunner:
 
     async def run_suite(self, cases: list[TestCase], seed_url: str) -> list[TestResult]:
         results = []
+        consec_fail = 0   # navigation failures/hangs in a row (circuit breaker)
         for i, case in enumerate(cases, 1):
+            # Site looks dead — don't grind the remaining cases at ~2 min each.
+            if consec_fail >= _CONSECUTIVE_FAIL_LIMIT:
+                remaining = cases[i - 1:]
+                print(
+                    f"[runner]   site unresponsive {consec_fail}x in a row — "
+                    f"skipping remaining {len(remaining)} case(s)",
+                    flush=True,
+                )
+                for skipped in remaining:
+                    results.append(TestResult(
+                        case=skipped, url=seed_url, observed="error",
+                        passed=(skipped.expected == "unknown"),
+                        detail="skipped: site unresponsive (circuit breaker tripped)",
+                        findings=[],
+                    ))
+                break
+
             print(f"[runner]   case {i}/{len(cases)}: {case.name}", flush=True)
             try:
                 result = await asyncio.wait_for(
@@ -35,6 +57,15 @@ class TestRunner:
                     detail=f"case exceeded {_CASE_BUDGET_S}s budget (hang guard tripped)",
                     findings=[],
                 )
+                consec_fail += 1
+            else:
+                # A reload-level navigation failure means the site itself is unhealthy.
+                # A judged 'error' (e.g. submit didn't fire) does NOT — the page loaded
+                # fine — so that resets the counter.
+                if result.observed == "error" and "navigation failed" in (result.detail or ""):
+                    consec_fail += 1
+                else:
+                    consec_fail = 0
             results.append(result)
         return results
 

@@ -76,6 +76,7 @@ class RunConfig:
     headless: bool = False             # show the browser by default — it's the point
     max_iterations: int = 12           # crawl depth cap (overrides agent_graph default)
     allow_all: bool = False            # sandbox: disable the destructive safety gate
+    provider: str = "groq"             # LLM backend: "groq" (cloud) or "ollama" (local)
 
 
 # --------------------------------------------------------------------------- #
@@ -193,7 +194,9 @@ class RunWorker(QObject):
             )
 
         self.status.emit("Launching browser…")
-        llm = get_provider()  # raises a clear error if GROQ_API_KEY is missing
+        # groq -> needs GROQ_API_KEY; ollama -> needs a local `ollama serve`.
+        llm = get_provider(cfg.provider)
+        self.log.emit(f"LLM provider: {cfg.provider}")
 
         # ~6 graph nodes per crawl lap; give recursion headroom beyond the cap.
         recursion_limit = max(150, cfg.max_iterations * 6 + 30)
