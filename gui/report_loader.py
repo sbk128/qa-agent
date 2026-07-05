@@ -26,12 +26,17 @@ class RunReport:
 
     @property
     def tests_passed(self) -> int:
-        return sum(1 for r in self.test_results if r.get("passed"))
+        return sum(1 for r in self.test_results if r.get("status") == "pass")
+
+    @property
+    def tests_scored(self) -> int:
+        # Denominator = cases with a real pass/fail oracle (pass + review).
+        return sum(1 for r in self.test_results if r.get("status") in ("pass", "review"))
 
     @property
     def label(self) -> str:
         when = self.when.strftime("%b %d, %Y  %H:%M") if self.when else self.name
-        return f"{when}   ·   {len(self.findings)} findings · {self.tests_passed}/{len(self.test_results)} passed"
+        return f"{when}   ·   {len(self.findings)} findings · {self.tests_passed}/{self.tests_scored} passed"
 
 
 def _parse_when(name: str) -> datetime | None:

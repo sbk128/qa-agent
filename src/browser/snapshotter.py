@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import re
-from playwright.async_api import Page, Error as PlaywrightError
+
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Page
+
 from src.models.element import Element
+
 
 class PageSnapshotter:
     """Turns a live Playwright page into a list of structured Elements."""
@@ -72,6 +76,7 @@ class PageSnapshotter:
                 required = await handle.get_attribute("required") is not None
                 visible = await handle.is_visible()
                 disabled = await handle.is_disabled()
+                readonly = await handle.get_attribute("readonly") is not None
                 placeholder = await handle.get_attribute('placeholder')
                 pattern = await handle.get_attribute("pattern")
                 max_length_attr = await handle.get_attribute("maxlength")
@@ -89,6 +94,7 @@ class PageSnapshotter:
                     required=required,
                     visible=visible,
                     disabled=disabled,
+                    readonly=readonly,
                     semantic_kind=kind,
                     widget_type=widget_type,
                     in_form=in_form,
@@ -204,7 +210,8 @@ class PageSnapshotter:
         autocomplete = await handle.get_attribute("autocomplete")
         if autocomplete:
             ac = autocomplete.lower()
-            if ac == "email": return "email"
+            if ac == "email":
+                return "email"
             if ac in ("tel", "tel-national", "tel-country-code", "tel-area-code", "tel-local", "tel-extension"):
                 return "phone"
             if ac in ("name", "given-name", "family-name", "additional-name"):
@@ -260,13 +267,13 @@ class PageSnapshotter:
 
         name_attr = await handle.get_attribute("name")
         if name_attr:
-            out.append(f'{tag}[name="{name_attr}"]')
+            out.append(f'{tag}[name="{self._escape(name_attr)}"]')
 
         # links get an href candidate
         if tag == "a":
             href = await handle.get_attribute("href")
             if href:
-                out.append(f'a[href="{href}"]')
+                out.append(f'a[href="{self._escape(href)}"]')
 
         # text-based candidate — only meaningful for links and buttons,
         # whitespace collapsed so multi-line text can't break the selector

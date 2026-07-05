@@ -1,8 +1,10 @@
 import re
 from datetime import datetime
+
 from playwright.async_api import Page
-from src.models.element import Element
+
 from src.models.action import ActionResult
+from src.models.element import Element
 from src.safety.gate import SafetyGate
 
 _SUBMIT_WORDS = ("submit", "save", "continue", "sign up", "register", "next",
@@ -91,21 +93,30 @@ class Executor:
         return results
 
     async def _fill_one(self, element, selector: str, value: str) -> ActionResult:
+        # Can't type into a control that's disabled/readonly — skip it explicitly
+        # (not a failure: happy-path readonly fields are pre-populated by the app).
+        if element and (element.disabled or element.readonly):
+            state = "disabled" if element.disabled else "readonly"
+            return ActionResult(action="skip", selector=selector, value=value, ok=True,
+                                detail=f"{state} field — not filled")
         try:
+            fallback = False
             if element and element.widget_type == "mui_select":
-                await self._mui_select(selector, value
-                                       )
+                fallback = await self._mui_select(selector, value)
             elif element and element.tag == "select":
-                await self._select(selector, value)
+                fallback = await self._select(selector, value)
 
             elif element and element.element_type == "radio":
                 # A radio group is one field: pick the one option matching `value`.
-                await self._radio(selector, value)
+                fallback = await self._radio(selector, value)
 
             elif element and element.tag == "input" and element.element_type == "checkbox":
-                # any "truthy" value means: tick it
-                if value.strip().lower() not in ("", "false", "no", "0", "unchecked"):
+                # Truthy value -> tick it; falsy value -> untick it (both are testable states).
+                truthy = value.strip().lower() not in ("", "false", "no", "0", "unchecked", "off")
+                if truthy:
                     await self.page.check(selector, timeout=5000)
+                else:
+                    await self.page.uncheck(selector, timeout=5000)
 
             elif element and (element.element_type == "date" or element.semantic_kind == "date"):
                 # Native date inputs require ISO; a text date-picker takes the raw value.
@@ -116,23 +127,32 @@ class Executor:
             else:  # text / email / textarea / unknown
                 await self.page.fill(selector, value, timeout=5000)
 
-            return ActionResult(action="fill", selector=selector, value=value, ok=True)
+            detail = "substituted a valid value (asked-for value not available)" if fallback else ""
+            return ActionResult(action="fill", selector=selector, value=value,
+                                ok=True, fallback=fallback, detail=detail)
         except Exception as e:
             return ActionResult(action="fill", selector=selector, value=value,
                                 ok=False, detail=str(e)[:200])
 
-    async def _select(self, selector: str, value: str) -> None:
-        # try by visible label, then by value, then just pick the first real option
-        for kwargs in ({"label": value}, {"value": value}, {"index": 1}):
+    async def _select(self, selector: str, value: str) -> bool:
+        # Try by visible label, then by value (exact intent). Returns fallback=False.
+        for kwargs in ({"label": value}, {"value": value}):
             try:
                 await self.page.select_option(selector, timeout=3000, **kwargs)
-                return
+                return False
             except Exception:
                 continue
-        raise Exception(f"no selectable option for {selector}")
+        # Fallback: pick the first real option so the form is at least fillable, but
+        # tell the caller we did NOT use the asked-for value.
+        try:
+            await self.page.select_option(selector, timeout=3000, index=1)
+            return True
+        except Exception as e:
+            raise Exception(f"no selectable option for {selector}") from e
 
-    async def _radio(self, group_selector: str, value: str) -> None:
+    async def _radio(self, group_selector: str, value: str) -> bool:
         # group_selector looks like input[name="gender"]; value is the chosen option label.
+        # Returns True if we fell back to an arbitrary option instead of `value`.
         m = re.search(r'name="([^"]+)"', group_selector)
         name = m.group(1) if m else None
         v = value.strip().lower()
@@ -144,25 +164,26 @@ class Executor:
                 lbl = labels.nth(i)
                 if (await lbl.inner_text()).strip().lower() == v:
                     await lbl.click(timeout=5000)
-                    return
+                    return False
             # 2. match by the radio's value attribute
             try:
                 await self.page.check(f'{base}[value="{value}"]', timeout=2500)
-                return
+                return False
             except Exception:
                 pass
-            # 3. fallback: first option in the group
+            # 3. fallback: first option in the group (value not matched)
             try:
                 await self.page.locator(base).first.check(timeout=2500)
-                return
+                return True
             except Exception:
                 pass
         # last resort: whatever selector we were handed
         await self.page.locator(group_selector).first.check(timeout=2500)
+        return True
 
     async def click(self, element: Element) -> ActionResult:
         verdict = await self.gate.evaluate(element)
-        if verdict.risk == "destructive":
+        if self.gate.should_block(verdict):
             return ActionResult(
                 action="skip",
                 selector=element.selector,
@@ -195,7 +216,8 @@ class Executor:
             detail=verdict.risk
         )
 
-    async def _mui_select(self, selector: str, value: str) -> None:
+    async def _mui_select(self, selector: str, value: str) -> bool:
+        # Returns True if we fell back to an arbitrary option instead of `value`.
         # Click trigger to open the popup
         await self.page.click(selector, timeout=5000)
         # Wait for listbox to render
@@ -222,6 +244,7 @@ class Executor:
 
         # 1. Exact, case-insensitive match against a non-placeholder option
         target_idx = None
+        used_fallback = False
         v = value.strip().lower()
         for i, text, disabled in candidates:
             if disabled or not text or _is_placeholder(text):
@@ -232,6 +255,7 @@ class Executor:
 
         # 2. Fallback: first real (non-placeholder, non-disabled) option
         if target_idx is None:
+            used_fallback = True
             for i, text, disabled in candidates:
                 if not disabled and text and not _is_placeholder(text):
                     target_idx = i
@@ -254,5 +278,6 @@ class Executor:
             await self.page.locator(".MuiBackdrop-root").wait_for(state="hidden", timeout=2000)
         except Exception:
             pass
+        return used_fallback
 
 

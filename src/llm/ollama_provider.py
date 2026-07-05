@@ -107,25 +107,34 @@ class OllamaProvider:
         # First choice: hand Ollama the schema as `format` (structured outputs).
         # This constrains decoding to schema-valid JSON — a big win for small
         # models. If the server can't compile it, fall back to plain JSON mode.
-        try:
-            data = await self._chat(
-                messages=messages, temperature=temperature, fmt=json_schema
-            )
-        except httpx.HTTPStatusError as e:
-            if e.response is not None and e.response.status_code == 400:
-                log.warning("ollama.schema_format_rejected.fallback_json")
-                data = await self._chat(
-                    messages=messages, temperature=temperature, fmt="json"
-                )
-            else:
-                raise
+        fmt: Any = json_schema
+        last_err: ValidationError | None = None
+        for attempt in range(2):
+            try:
+                data = await self._chat(messages=messages, temperature=temperature, fmt=fmt)
+            except httpx.HTTPStatusError as e:
+                if e.response is not None and e.response.status_code == 400:
+                    log.warning("ollama.schema_format_rejected.fallback_json")
+                    fmt = "json"
+                    data = await self._chat(messages=messages, temperature=temperature, fmt=fmt)
+                else:
+                    raise
 
-        raw = data.get("message", {}).get("content") or "{}"
-        try:
-            return schema.model_validate_json(raw)
-        except ValidationError:
-            log.error("ollama.structured.invalid_json", raw=raw)
-            raise
+            raw = data.get("message", {}).get("content") or "{}"
+            try:
+                return schema.model_validate_json(raw)
+            except ValidationError as e:
+                # One corrective retry, feeding the validation error back to the model.
+                last_err = e
+                log.warning("ollama.structured.invalid_json", attempt=attempt)
+                messages = messages + [
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content":
+                        f"That did not match the schema: {str(e)[:500]}. "
+                        "Return ONLY a corrected JSON object."},
+                ]
+        log.error("ollama.structured.invalid_json.final")
+        raise last_err  # type: ignore[misc]
 
     async def _chat(
         self,

@@ -1,5 +1,6 @@
-from pydantic import BaseModel
 from typing import Literal
+
+from pydantic import BaseModel
 
 SemanticKind = Literal["email", "phone", "date", "name", "address",
     "currency", "search", "password", "unknown"]
@@ -14,6 +15,7 @@ class Element(BaseModel):
     required: bool = False
     visible: bool = True
     disabled: bool = False
+    readonly: bool = False
     semantic_kind: SemanticKind = "unknown"
     widget_type: WidgetType = "native"
     options: list[str] | None = None

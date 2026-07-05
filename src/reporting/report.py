@@ -1,6 +1,6 @@
-from collections import defaultdict
 import json
 import re
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -8,32 +8,34 @@ from urllib.parse import urlparse
 _SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
 
-def write_report(state, out_dir="reports") -> Path:
-    run = Path(out_dir) / datetime.now().strftime("run-%Y%m%d-%H%M%S")
-    run.mkdir(parents=True, exist_ok=True)
+def write_report(state, out_dir="reports", run_dir=None, meta=None) -> Path:
+    """Write report.md + report.json.
 
-    # encoding="utf-8": the report contains ⚠ 🤔 ✓ ✗ etc., which the Windows
-    # default (cp1252) can't encode — without this, write_text raises
-    # UnicodeEncodeError and the whole run dies at report time.
-    (run / "report.md").write_text(build_report(state), encoding="utf-8")
+    `run_dir` lets the caller pre-create the run folder (so per-case screenshots can
+    be written into it during the run and linked from the report). `meta` is a dict of
+    run metadata (target, provider, model, duration…) rendered at the top of the report.
+    """
+    run = Path(run_dir) if run_dir else Path(out_dir) / datetime.now().strftime("run-%Y%m%d-%H%M%S")
+    run.mkdir(parents=True, exist_ok=True)
+    meta = meta or {}
+
+    # encoding="utf-8": the report contains ⚠ 🤔 ✓ ✗ etc., which the Windows default
+    # (cp1252) can't encode — without this, write_text raises UnicodeEncodeError.
+    (run / "report.md").write_text(build_report(state, meta), encoding="utf-8")
 
     data = {
+        "meta": meta,
         "visited_urls": state.get("visited_urls", []),
-        "action_history": [a.model_dump() for a in state.get("action_history", [])],
         "findings": [f.model_dump() for f in state.get("findings", [])],
         "test_results": [r.model_dump() for r in state.get("test_results", [])],
     }
-    (run / "report.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
+    (run / "report.json").write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
     return run
 
 
 # --- small rendering helpers (turn raw data into something a human can read) ---
 
 def _short_field(selector: str) -> str:
-    """Pull a readable field name out of an ugly selector.
-
-    e.g. 'input[name="firstName"]' -> 'firstName', '#age' -> 'age'.
-    """
     for pat in (r'\[name="([^"]+)"\]', r'\[data-testid="([^"]+)"\]', r'#([\w-]+)'):
         m = re.search(pat, selector)
         if m:
@@ -42,7 +44,6 @@ def _short_field(selector: str) -> str:
 
 
 def _short_value(v: str) -> str:
-    """A compact, safe display of a value we typed into a field."""
     if v is None:
         return "(none)"
     if v == "":
@@ -57,7 +58,6 @@ def _short_value(v: str) -> str:
 
 
 def _typed(case) -> str:
-    """One compact line of what the robot actually filled in."""
     if not case.field_values:
         return "(nothing filled)"
     return ", ".join(
@@ -66,7 +66,6 @@ def _typed(case) -> str:
 
 
 def _server_note(result) -> str:
-    """If the server answered with a 4xx/5xx during this case, surface it."""
     statuses = []
     for f in result.findings:
         if f.category == "network_error":
@@ -77,41 +76,58 @@ def _server_note(result) -> str:
 
 
 def _has_hard_evidence(result) -> bool:
-    """True if the app itself complained during this case — the server returned
-    a 4xx/5xx, or a script crashed. That's concrete proof something is off,
-    independent of the robot's *guess* about what should have happened.
-    """
+    """True if the app itself complained (4xx/5xx or a script crash) — concrete proof
+    something is off, independent of the robot's guess about what should happen."""
     return any(f.category in ("network_error", "js_error") for f in result.findings)
 
 
-def build_report(state) -> str:
+def _meta_block(meta: dict) -> list[str]:
+    if not meta:
+        return []
+    rows = [
+        ("Target", meta.get("target")),
+        ("Provider / model", " / ".join(x for x in (meta.get("provider"), meta.get("model")) if x)),
+        ("Locale", meta.get("locale")),
+        ("Safety gate", "disabled (sandbox)" if meta.get("allow_all") else "enabled"),
+        ("Duration", meta.get("duration")),
+        ("Started", meta.get("started")),
+    ]
+    out = ["## Run", "", "| | |", "|---|---|"]
+    out += [f"| {k} | {v} |" for k, v in rows if v]
+    out.append("")
+    return out
+
+
+def build_report(state, meta=None) -> str:
+    meta = meta or {}
     findings = state.get("findings", [])
     visited = state.get("visited_urls", [])
     results = state.get("test_results", [])
 
-    L = []
+    L: list[str] = []
 
     # ---- header: the one-line "what happened" ----
-    sample_url = visited[0] if visited else (results[0].url if results else "")
+    sample_url = meta.get("target") or (visited[0] if visited else (results[0].url if results else ""))
     host = urlparse(sample_url).netloc or sample_url
-    passed = sum(r.passed for r in results)
-    total = len(results)
+    scored = [r for r in results if r.counts_toward_score]        # pass + review only
+    passed = sum(1 for r in results if r.status == "pass")
     when = datetime.now().strftime("%d %b %Y")
 
     bits = [b for b in (host, f"{len(visited)} pages") if b]
-    if total:
-        bits.append(f"{passed}/{total} checks behaved as expected")
+    if scored:
+        bits.append(f"{passed}/{len(scored)} checks behaved as expected")
     L.append("# QA Test Report")
     L.append(f"_{' · '.join(bits)} · {when}_")
     L.append("")
+    L += _meta_block(meta)
 
-    # ---- sort results into three buckets ----
-    review = [r for r in results if not r.passed and r.observed != "error"]
-    errored = [r for r in results if r.observed == "error"]
+    # ---- buckets by honest status ----
+    review = [r for r in results if r.status == "review"]
+    errored = [r for r in results if r.status == "error"]
+    skipped = [r for r in results if r.status == "skipped"]
+    info = [r for r in results if r.status == "info"]
 
     # ---- 1. flagged cases, split by how much we actually trust them ----
-    # "worth" = the app gave a concrete error (hard evidence). "maybe" = the form
-    # just didn't match the robot's guess, with nothing actually broken (soft).
     worth = [r for r in review if _has_hard_evidence(r)]
     maybe = [r for r in review if not _has_hard_evidence(r)]
 
@@ -129,6 +145,8 @@ def build_report(state) -> str:
             L.append(f'{i}. **{r.url}** — "{r.case.name}"')
             L.append(f"   - We typed: {_typed(r.case)}")
             L.append(f"   - Expected: **{r.case.expected}**   Got: **{r.observed}**  ({note})")
+            if r.screenshot_path:
+                L.append(f"   - Evidence: [screenshot]({r.screenshot_path})")
         L.append("")
 
     if maybe:
@@ -139,9 +157,10 @@ def build_report(state) -> str:
             "guess — skim these, don't trust them.\n"
         )
         for r in maybe:
+            shot = f"  ([screenshot]({r.screenshot_path}))" if r.screenshot_path else ""
             L.append(
                 f'- {r.url} — "{r.case.name}"  '
-                f"(expected {r.case.expected}, got {r.observed})"
+                f"(expected {r.case.expected}, got {r.observed}){shot}"
             )
         L.append("")
 
@@ -154,43 +173,52 @@ def build_report(state) -> str:
         by_url = defaultdict(list)
         for r in results:
             by_url[r.url].append(r)
+        _mark = {"pass": "✓", "review": "⚠", "info": "•", "error": "✗", "skipped": "–"}
         for url, page_results in by_url.items():
-            page_passed = sum(r.passed for r in page_results)
-            L.append(f"### {url} — {page_passed}/{len(page_results)} ok")
-            L.append("| Check | We typed | Should | Did | OK |")
+            page_scored = [r for r in page_results if r.counts_toward_score]
+            page_passed = sum(1 for r in page_results if r.status == "pass")
+            L.append(f"### {url} — {page_passed}/{len(page_scored)} ok")
+            L.append("| Check | We typed | Should | Did | Status |")
             L.append("|---|---|---|---|---|")
             for r in page_results:
-                ok = "✓" if r.passed else ("⚠" if r.observed != "error" else "✗")
                 typed = _typed(r.case).replace("|", "\\|")
                 L.append(
                     f"| {r.case.name} | {typed} | {r.case.expected} "
-                    f"| {r.observed} | {ok} |"
+                    f"| {r.observed} | {_mark.get(r.status, '?')} {r.status} |"
                 )
             L.append("")
 
-    # ---- 3. cases the robot couldn't finish ----
+    # ---- 3. cases that never produced a verdict ----
     if errored:
         L.append(f"## Couldn't complete  ({len(errored)})")
-        L.append(
-            "_Page failed to load, submit didn't fire, or the server errored (5xx)._\n"
-        )
+        L.append("_Submit didn't fire, a fill failed, or the server errored (5xx)._\n")
         for r in errored:
-            note = _server_note(r)
-            note = f" — {note}" if note else ""
-            L.append(f'- {r.url} — "{r.case.name}"{note}')
+            L.append(f'- {r.url} — "{r.case.name}" — {r.detail}')
         L.append("")
 
-    # ---- 4. genuine app errors the robot tripped over (crashes / JS errors) ----
-    crashes = [f for f in findings if f.category == "js_error"]
-    if crashes:
+    if skipped:
+        L.append(f"## Skipped  ({len(skipped)})")
+        L.append("_Never ran — the site was unresponsive or a modal wouldn't open._\n")
+        for r in skipped:
+            L.append(f'- {r.url} — "{r.case.name}" — {r.detail}')
+        L.append("")
+
+    if info:
+        L.append(f"## Informational — no oracle  ({len(info)})")
+        L.append("_Ran, but the case had no known-correct answer to check against._\n")
+        for r in info:
+            L.append(f'- {r.url} — "{r.case.name}" (observed {r.observed})')
+        L.append("")
+
+    # ---- 4. app errors: crashes AND failed app requests ----
+    app_errors = [f for f in findings if f.category in ("js_error", "network_error")]
+    if app_errors:
         groups: dict = {}
-        for f in crashes:
-            key = (f.severity, f.description, f.url)
+        for f in app_errors:
+            key = (f.severity, f.category, f.description, f.url)
             groups.setdefault(key, {"f": f, "n": 0})
             groups[key]["n"] += 1
-        ordered = sorted(
-            groups.values(), key=lambda g: _SEVERITY_ORDER.get(g["f"].severity, 99)
-        )
+        ordered = sorted(groups.values(), key=lambda g: _SEVERITY_ORDER.get(g["f"].severity, 99))
         L.append("## Errors the robot hit")
         for g in ordered:
             f = g["f"]

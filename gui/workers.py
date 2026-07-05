@@ -16,11 +16,13 @@ import asyncio
 import sys
 import traceback
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from PySide6.QtCore import QObject, Signal, Slot
 
-from gui.paths import PROJECT_ROOT, REPORTS_DIR, has_saved_session, load_env
+from gui.paths import REPORTS_DIR, has_saved_session, load_env
 
 
 # --------------------------------------------------------------------------- #
@@ -171,17 +173,26 @@ class RunWorker(QObject):
 
         # Imported here (not at module load) so the GUI still starts even if a
         # heavy/optional dependency is missing — the error surfaces at run time.
-        import src.agent.agent_graph as agent_graph
         from src.agent.agent_graph import build_agent_graph
         from src.agent.observer import Observer
         from src.browser.session import BrowserSession
+        from src.config import AppConfig
         from src.llm import get_provider
         from src.reporting.report import write_report
 
         cfg = self._cfg
 
-        # Override the module-level crawl cap with the value chosen in the UI.
-        agent_graph.MAX_ITERATIONS = cfg.max_iterations
+        # A typed config object — no more mutating a module-level global.
+        app_config = AppConfig(
+            url=cfg.url, routes=cfg.routes, locale=cfg.locale, provider=cfg.provider,
+            headless=cfg.headless, max_iterations=cfg.max_iterations,
+            allow_all=cfg.allow_all, capture_screenshots=True, report_dir=str(REPORTS_DIR),
+        )
+
+        seed_host = urlparse(cfg.url).netloc
+        run_dir = REPORTS_DIR / datetime.now().strftime("run-%Y%m%d-%H%M%S")
+        evidence_dir = run_dir / "evidence"
+        started = datetime.now()
 
         storage_state = None
         if cfg.auth_path and has_saved_session(cfg.auth_path):
@@ -204,17 +215,18 @@ class RunWorker(QObject):
         old_out, old_err = sys.stdout, sys.stderr
         sys.stdout = _SignalStream(self.log.emit, mirror=old_out)
         sys.stderr = _SignalStream(self.log.emit, mirror=old_err)
+        crashed: Exception | None = None
+        out_dir = run_dir
         try:
             async with BrowserSession(headless=cfg.headless, storage_state=storage_state) as session:
-                observer = Observer(session.page)
+                observer = Observer(session.page, app_host=seed_host)
                 if cfg.allow_all:
-                    self.log.emit("⚠️  --allow-all: safety gate disabled (sandbox mode).")
-                app = build_agent_graph(session, llm, observer, allow_all=cfg.allow_all)
+                    self.log.emit("⚠️  Sandbox mode: destructive safety gate disabled.")
+                app = build_agent_graph(session, llm, observer, app_config, evidence_dir=evidence_dir)
 
                 initial = {
                     "seed_url": cfg.url,
                     "visited_urls": [],
-                    "action_history": [],
                     "findings": [],
                     # Seed the frontier with any user-listed routes so the agent
                     # visits them even though this SPA exposes no <a href> links.
@@ -235,15 +247,27 @@ class RunWorker(QObject):
                     # Stop was pressed: unwind cleanly and still report what we have.
                     self._stop = True
                     self.log.emit("Run stopped by user.")
+                except Exception as e:
+                    # A crash mid-crawl must NOT lose the results gathered so far.
+                    crashed = e
+                    self.log.emit(f"\n⚠️  Run failed mid-crawl: {e}\n{traceback.format_exc()}")
 
-                # Build the state dict write_report expects from what we accumulated.
+                meta = {
+                    "target": cfg.url,
+                    "provider": cfg.provider,
+                    "model": getattr(llm, "_default_model", None),
+                    "locale": cfg.locale,
+                    "allow_all": cfg.allow_all,
+                    "started": started.strftime("%Y-%m-%d %H:%M:%S"),
+                    "duration": f"{(datetime.now() - started).total_seconds():.0f}s",
+                    "crashed": str(crashed) if crashed else None,
+                }
                 final_state = {
                     "visited_urls": self._visited,
-                    "action_history": [],
                     "findings": self._findings,
                     "test_results": self._test_results,
                 }
-                out_dir = write_report(final_state, out_dir=str(REPORTS_DIR))
+                out_dir = write_report(final_state, run_dir=run_dir, meta=meta)
         finally:
             sys.stdout, sys.stderr = old_out, old_err
             # Close the Groq SDK's httpx client *now*, while this run's event loop
@@ -251,19 +275,22 @@ class RunWorker(QObject):
             # prints a noisy "RuntimeError: Event loop is closed" traceback.
             await self._aclose_llm(llm)
 
-        passed = sum(1 for r in self._test_results if r.passed)
+        passed = sum(1 for r in self._test_results if r.status == "pass")
+        scored = sum(1 for r in self._test_results if r.counts_toward_score)
         summary = {
             "report_dir": str(out_dir),
             "report_md": str(Path(out_dir) / "report.md"),
             "stopped": self._stop,
+            "crashed": str(crashed) if crashed else None,
             "iterations": self._iteration,
             "visited": list(self._visited),
             "findings": [f.model_dump() for f in self._findings],
             "test_results": [r.model_dump() for r in self._test_results],
             "tests_passed": passed,
-            "tests_total": len(self._test_results),
+            "tests_total": scored,
         }
-        self.status.emit("Done" if not self._stop else "Stopped")
+        status = "Stopped" if self._stop else ("Error" if crashed else "Done")
+        self.status.emit(status)
         self.finished.emit(summary)
 
     @staticmethod

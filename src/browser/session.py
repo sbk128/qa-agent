@@ -1,17 +1,13 @@
-"""Thin async wrapper around a single Playwright page for Phase 0.
+"""Thin async wrapper around a single Playwright page.
 
-The real page snapshotter lands in Phase 1. This file exposes just enough
-to open a URL, grab a tiny text summary, and take a screenshot.
+Opens a URL, grabs a small text summary for the LLM, takes screenshots/traces,
+and extracts the interactive elements (via PageSnapshotter).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-import re
 from typing import Self
-from src.models.element import Element
-from typing import List
-from src.browser.snapshotter import PageSnapshotter
 
 from playwright.async_api import (
     Browser,
@@ -20,6 +16,9 @@ from playwright.async_api import (
     Playwright,
     async_playwright,
 )
+
+from src.browser.snapshotter import PageSnapshotter
+from src.models.element import Element
 
 
 @dataclass
@@ -92,13 +91,26 @@ class BrowserSession: # Opens a new browser session.
         return self._page
 
     async def goto(self, url: str, *, wait_until: str = "domcontentloaded",
-                   timeout: float | None = None) -> None:
-        await self.page.goto(url, wait_until=wait_until, timeout=timeout)
+                   timeout: float | None = None):
+        response = await self.page.goto(url, wait_until=wait_until, timeout=timeout)
         try:
             await self.page.wait_for_load_state("networkidle", timeout=5000)
         except Exception:
-            pass # Some paged never go idle
-        
+            pass  # Some pages never go idle
+        return response
+
+    async def start_tracing(self) -> None:
+        """Begin a Playwright trace (screenshots + snapshots + sources) for the run."""
+        if self._context is not None:
+            await self._context.tracing.start(screenshots=True, snapshots=True, sources=True)
+
+    async def stop_tracing(self, path: str | Path) -> Path:
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if self._context is not None:
+            await self._context.tracing.stop(path=str(out))
+        return out
+
     async def screenshot(self, path: str | Path) -> Path:
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -132,16 +144,5 @@ class BrowserSession: # Opens a new browser session.
             text_preview=text,
         )
      
-    def build_context_blob(summary: PageSummary, elements: list[Element]) -> str:
-        field_lines = [
-            f" - {e.tag} {e.semantic_kind} {e.name}"
-            for e in elements if e.visible
-        ][:25]  # Limit to 25 elements for prompt brevity
-        return (
-            summary.to_prompt() + 
-            "\n\nInteractive elements (sample): \n"
-            + "\n".join(field_lines)
-        )
-    
     async def extract_elements(self) -> list[Element]:
-        return await PageSnapshotter(self.page).extract_elements()  
+        return await PageSnapshotter(self.page).extract_elements()

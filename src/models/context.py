@@ -1,5 +1,7 @@
 from typing import Literal
+
 from pydantic import BaseModel
+
 
 class InferredContext(BaseModel): 
     # Setting up defaults in case LLM omits any field we get a 

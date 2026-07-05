@@ -1,8 +1,9 @@
+from src.data.edge_cases import KIND_SPECIFIC, UNIVERSAL
 from src.llm import LLMProvider
+from src.models.context import InferredContext
 from src.models.data import FormFill
 from src.models.element import Element
-from src.models.context import InferredContext
-from src.data.edge_cases import UNIVERSAL, KIND_SPECIFIC
+
 
 class DataGenerator:
     def __init__(self, llm: LLMProvider) -> None:

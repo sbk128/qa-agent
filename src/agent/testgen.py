@@ -1,9 +1,10 @@
+from src.data.edge_cases import KIND_SPECIFIC, UNIVERSAL
+from src.data.generator import describe_fields, fillable
 from src.llm import LLMProvider
-from src.models.testcase import TestSuite, TestCase
-from src.models.element import Element
 from src.models.context import InferredContext
-from src.data.generator import fillable, describe_fields
-from src.data.edge_cases import UNIVERSAL, KIND_SPECIFIC
+from src.models.element import Element
+from src.models.testcase import TestCase, TestSuite
+
 
 # Injecting a nasty literal only makes sense for free-text fields — dropdowns /
 # radios / checkboxes auto-repair to a valid choice, so junk there never sticks.

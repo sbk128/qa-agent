@@ -80,21 +80,40 @@ class GroqProvider:
             + "Do not wrap it in markdown.\n"
             + json.dumps(json_schema)
         )
-        resp = await self._call(
-            model=model or self._default_model,
-            messages=[
-                {"role": "system", "content": sys_msg},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=temperature,
-            response_format={"type": "json_object"},
-        )
-        raw = resp.choices[0].message.content or "{}"
-        try:
-            return schema.model_validate_json(raw)
-        except ValidationError:
-            log.error("groq.structured.invalid_json", raw=raw)
-            raise
+        messages = [
+            {"role": "system", "content": sys_msg},
+            {"role": "user", "content": prompt},
+        ]
+        # One corrective retry: small models occasionally emit JSON that doesn't
+        # validate (wrong enum, missing field). Feed the error back and try once more
+        # before giving up — otherwise a single bad response drops a whole page's suite.
+        last_err: ValidationError | None = None
+        for attempt in range(2):
+            resp = await self._call(
+                model=model or self._default_model,
+                messages=messages,
+                temperature=temperature,
+                response_format={"type": "json_object"},
+            )
+            raw = resp.choices[0].message.content or "{}"
+            try:
+                return schema.model_validate_json(raw)
+            except ValidationError as e:
+                last_err = e
+                log.warning("groq.structured.invalid_json", attempt=attempt)
+                messages = messages + [
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content":
+                        f"That did not match the schema: {str(e)[:500]}. "
+                        "Return ONLY a corrected JSON object."},
+                ]
+        log.error("groq.structured.invalid_json.final")
+        raise last_err  # type: ignore[misc]
+
+    # Status codes worth retrying. A 401 (bad key) or 400 (bad request) will fail
+    # identically every time — retrying them just wastes ~30s of backoff, so we
+    # re-raise those immediately instead.
+    _RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
 
     async def _call(self, **kwargs: Any):
         last_err: Exception | None = None
@@ -108,14 +127,21 @@ class GroqProvider:
                 )
                 await asyncio.sleep(delay)
                 last_err = e
-            except (APIConnectionError, APITimeoutError, APIStatusError) as e:
+            except APIStatusError as e:
+                status = getattr(e, "status_code", None)
+                if status is not None and status not in self._RETRYABLE_STATUS:
+                    # Non-transient (auth, bad request) — fail fast, don't burn retries.
+                    log.error("groq.non_retryable", status=status, error=str(e))
+                    raise
                 delay = self._backoff(attempt)
-                log.warning(
-                    "groq.transient_error",
-                    attempt=attempt,
-                    sleep_s=round(delay, 2),
-                    error=str(e),
-                )
+                log.warning("groq.transient_error", attempt=attempt,
+                            sleep_s=round(delay, 2), error=str(e))
+                await asyncio.sleep(delay)
+                last_err = e
+            except (APIConnectionError, APITimeoutError) as e:
+                delay = self._backoff(attempt)
+                log.warning("groq.transient_error", attempt=attempt,
+                            sleep_s=round(delay, 2), error=str(e))
                 await asyncio.sleep(delay)
                 last_err = e
         raise RuntimeError(

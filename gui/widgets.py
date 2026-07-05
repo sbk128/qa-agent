@@ -163,30 +163,44 @@ class TestResultsTree(QWidget):
         lay.addWidget(self.summary)
         lay.addWidget(self.tree)
 
+    _MARKS = {"pass": "✓", "review": "⚑ review", "info": "• info",
+              "error": "✗ error", "skipped": "– skipped"}
+
+    @staticmethod
+    def _status(r: dict) -> str:
+        # Prefer the computed status; fall back for older report.json without it.
+        return r.get("status") or ("pass" if r.get("passed") else "review")
+
     def set_results(self, results: list[dict]) -> None:
         self.tree.clear()
         if not results:
             self.summary.setText("No tests run yet.")
             return
 
-        passed = sum(1 for r in results if r.get("passed"))
-        self.summary.setText(f"<b>{passed}/{len(results)}</b> cases passed across {len(set(r.get('url') for r in results))} page(s)")
+        passed = sum(1 for r in results if self._status(r) == "pass")
+        scored = sum(1 for r in results if self._status(r) in ("pass", "review"))
+        n_pages = len(set(r.get("url") for r in results))
+        self.summary.setText(
+            f"<b>{passed}/{scored}</b> cases passed across {n_pages} page(s) "
+            f"(cases without a clear right answer aren't scored)"
+        )
 
         by_url: dict[str, list[dict]] = {}
         for r in results:
             by_url.setdefault(r.get("url", ""), []).append(r)
 
         for url, page_results in by_url.items():
-            page_passed = sum(1 for r in page_results if r.get("passed"))
-            parent = QTreeWidgetItem([f"{url}   —   {page_passed}/{len(page_results)} passed"])
+            page_passed = sum(1 for r in page_results if self._status(r) == "pass")
+            page_scored = sum(1 for r in page_results if self._status(r) in ("pass", "review"))
+            parent = QTreeWidgetItem([f"{url}   —   {page_passed}/{page_scored} passed"])
             parent.setFirstColumnSpanned(True)
             parent.setFont(0, _bold())
             self.tree.addTopLevelItem(parent)
 
             for r in page_results:
                 case = r.get("case", {})
-                ok = r.get("passed")
-                mark = "✓" if ok else "⚑ review"
+                status = self._status(r)
+                mark = self._MARKS.get(status, status)
                 observed = r.get("observed", "")
                 child = QTreeWidgetItem(
                     [
@@ -197,7 +211,10 @@ class TestResultsTree(QWidget):
                         r.get("detail", ""),
                     ]
                 )
-                child.setForeground(0, QColor(PASS_COLOR if ok else FAIL_COLOR))
+                colour = PASS_COLOR if status == "pass" else (
+                    FAIL_COLOR if status in ("review", "error") else TEXT_DIM
+                )
+                child.setForeground(0, QColor(colour))
                 child.setForeground(1, QColor(CATEGORY_COLORS.get(case.get("category"), "#c3cee3")))
                 child.setForeground(3, QColor(OUTCOME_COLORS.get(observed, "#c3cee3")))
                 tip = (

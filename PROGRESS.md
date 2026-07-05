@@ -4,16 +4,58 @@ Living checklist of build progress. `[x]` done, `[ ]` todo, ← current focus.
 See [`qa_agent_plan_v2.md`](../qa_agent_plan_v2.md) for the original plan.
 
 ## Where you are right now
-**The execution pipeline works end-to-end on a real Material UI app, and the whole data-quality
-thread is closed: the test engine now generates genuinely valid, constraint-aware data and the
-happy-path case is ACCEPTED on the OPD bookappointment page (verified 2026-06-19).**
-**Next: Test Engine Step 4 (report pass/fail table + run the engine on every crawled form).**
+**The pipeline now runs end-to-end on TWO LLM backends: Groq (cloud) and a local Ollama model
+(`gemma4:e4b`) — verified by a clean 22-case run on the demoqa practice form (2026-06-29, 11/22,
+report written). Test Engine Step 4 is DONE (per-case report table + engine runs on every crawled
+page).**
+**Next: saved suites — cache the per-form suite and let a human edit `expected` once (that's the
+missing oracle). One fix closes gap #1(a) AND gap #3 (runs become comparable/regression-able).**
 
 The original 6-phase plan is done. On top of it, a 4-step "test engine" (LLM-generated test
-cases → execute → judge pass/fail). Steps 1–3 are built and now verified end-to-end on a live
-form; step 4 (report + crawl integration) remains.
+cases → execute → judge pass/fail). All four steps are built and verified on live forms.
 
-### → Do this next
+### → Do this next (reassessed 2026-07-03)
+1. **Saved suites — one fix for gaps #1(a) + #3.** Cache the generated suite per form (JSON keyed by
+   URL), reuse it on later runs, and let a human edit `expected` once — that edit IS the missing
+   oracle. Runs become comparable (regression detection), and Ollama re-runs skip the slow plan step.
+2. **Dashboard / read-only mode.** Pages with no submit get zero coverage today (`plan_node` skips
+   them). Scope: click filters, assert content reacts, no console/network errors, flag empty states.
+3. **Judge scoping.** Attribute 4xx/5xx to the actual submit request (drop favicon/analytics noise);
+   distinguish 404 (route error) from 400/409/422 (validation reject).
+4. **Coverage leftovers.** Icon-only `+` FAB launchers (match aria-label/testid), multi-step wizard
+   walking, button-nav auto-discovery (routes seed works but is manual).
+5. **Agent self-tests.** `tests/` is empty; `_judge`, `build_edge_cases`, `find_submit`, the gate's
+   rules layer are pure-ish and cheap to cover. Two providers + multi-device now — regressions are
+   otherwise invisible.
+- Micro-cleanup: `agent_graph.py` has a redundant `observe → END` edge alongside `observe → decide`
+  (decide's conditional edge is what actually routes to END). Harmless, confusing.
+
+### Worklog
+- **Session 2026-06-29 — local LLM (Ollama) + Windows fixes + flaky-site resilience.** Verified by a
+  clean end-to-end run on the demoqa practice form using the local model (22 cases, 11/22, report OK).
+  - **`OllamaProvider` (`src/llm/ollama_provider.py`, NEW).** Mirrors GroqProvider (text / structured /
+    retry-backoff) against a local `ollama serve` via `/api/chat`; default model `gemma4:e4b`
+    (override via `OLLAMA_MODEL` / `OLLAMA_BASE_URL`). `structured()` passes the Pydantic JSON schema
+    as Ollama's `format` (constrained decoding — much better JSON from small models), falling back to
+    plain JSON mode if the schema is rejected. Registered in `get_provider(name)` — explicit arg wins,
+    else `LLM_PROVIDER` env. The `model` kwarg is accepted-but-ignored (one local model; callers
+    passing Groq slugs like SMALL_MODEL must not break).
+  - **Truncation fix (the "plan ok: 0 cases" bug).** Ollama's default ~4k context silently truncated
+    the test-suite JSON mid-string (`EOF while parsing`). Now `num_ctx=16384`, `num_predict=-1`
+    (env-overridable). The model reasoned fine — it just ran out of room.
+  - **GUI: LLM provider dropdown (`main_window.py`, `workers.py`).** Groq (cloud) / Ollama (local) per
+    run → `RunConfig.provider` → `get_provider(cfg.provider)`. The Groq-key check only applies when
+    Groq is selected; the header chip tracks the choice. NOTE for Ollama runs: keep Sandbox/allow-all
+    ON — the safety gate otherwise fires a per-click LLM call, which is painfully slow locally.
+  - **UTF-8 report fix (Windows).** `write_text` defaulted to cp1252 → `UnicodeEncodeError` on ⚠/✓ —
+    the whole run died at report time. All report writes/reads now pass `encoding="utf-8"`
+    (`report.py`, `report_loader.py`, `main_window.py`). Pre-existing; would have crashed on Groq too.
+  - **Circuit breaker (`runner.py`).** demoqa went unresponsive mid-run and every remaining case
+    burned the full 120s hang budget (~28 min of dead grind). Now after `_CONSECUTIVE_FAIL_LIMIT=2`
+    navigation failures/hangs in a row, the rest of the page's cases are recorded as skipped `error`s.
+    A judged `error` on a healthy page load resets the counter (only site-level failures count).
+  - **Edge-case cap `_MAX_PER_FIELD` 6 → 2 (`testgen.py`).** demoqa form: 45 → 22 cases. Faster runs,
+    gentler on flaky public targets, still per-field coverage.
 - **Session 2026-06-27/28 — trustworthiness + robustness + coverage.** A run of fixes, all verified
   by re-running on the live app:
   - **Report fully redesigned (`reporting/report.py`).** Leads with what to act on, shows the actual
@@ -83,8 +125,9 @@ form; step 4 (report + crawl integration) remains.
   (Last 7/30/90 days, date range, Apply) and assert the data changes + no console/network errors +
   flag empty states (`No Data Available`, `₹0`). Correctness of the numbers needs an oracle the agent
   doesn't have, so scope = "loads, reacts, doesn't error," not value-checking.
-- **Step 4 — Report + crawl integration (still pending).** Per-case pass/fail table in the report
-  (data already on each `TestResult.findings`); run the engine on every crawled form, not just the seed.
+- **Step 4 — Report + crawl integration — DONE.** Per-case pass/fail table = "Results by form" in
+  `report.py` (2026-06-27 redesign); the engine already runs on every crawled page (`plan_node` →
+  `execute_node` each lap, + modal scan). Verified on a 2-page demoqa crawl (2026-06-29).
 - **Note on the `review` mismatches.** Edge cases that expect `rejected` often show `accepted` (the form
   under-validates, or the LLM's `expected` was too strict). Framed as *review*, not bugs.
 
@@ -100,8 +143,9 @@ Ordered by impact. The engine *drives* real apps well now; the weaknesses are mo
    invalid values, and `_mui_select`/radio fills auto-repair bad dropdown choices, so the "bad" input
    often isn't bad by submit time; (c) ~~**client-side only**~~ **DONE (2026-06-26)** — `_judge` now also
    reads the Observer's 4xx/5xx network findings, so a backend rejection is no longer masked as a false
-   `accepted` (see worklog up top). → Remaining highest-value fix: inject genuinely-invalid values from
-   the static `edge_cases()` lib instead of trusting the LLM (addresses (b)); (a) no-oracle still open.
+   `accepted` (see worklog up top). ~~(b)~~ **DONE** — `build_edge_cases` (`testgen.py`) injects real
+   nasties from the static lib one-field-at-a-time onto the LLM's happy-path baseline (capped
+   `_MAX_PER_FIELD=2`). → Remaining: **(a) no-oracle** → saved suites (see Do this next).
 2. **Coverage is shallow** (partly addressed 2026-06-28). The crawler still only follows `<a href>`,
    but the **routes seed** (GUI "Also test these pages" → `RunConfig.routes` → `frontier`) now lets you
    hand it the pages this button-driven SPA hides, so multi-page testing works. Still open: button/
@@ -165,6 +209,8 @@ copy, so form submits creating real records is fine — no `--no-submit` needed.
 ## Phase 0 — Setup ✅
 - [x] Repo scaffold, `pyproject.toml`, uv env
 - [x] LLM provider abstraction + `GroqProvider` (retry, JSON mode, backoff)
+- [x] `OllamaProvider` — local LLM via Ollama `/api/chat`, schema-constrained `structured()`,
+      `num_ctx=16384`; selectable via `get_provider(name)` / `LLM_PROVIDER` / GUI dropdown (2026-06-29)
 - [x] `BrowserSession` (open / screenshot / summary)
 - [x] Single-node LangGraph + `main.py` CLI
 
@@ -255,10 +301,11 @@ The "LLM generates test cases, runs them, judges pass/fail" build on top of the 
       - **Verified end-to-end 2026-06-19** via `scripts/show_agent.py` on /opd/bookappointment: happy
         path `accepted`, edge mismatches surfaced as `review`. (Runs inside the graph's execute node;
         no separate `show_run.py` demo needed.)
-- [ ] ← **Step 4 — Report + crawl integration** (NEXT)
-      - Pass/fail table per case in the report — the data is already on each `TestResult` (incl.
-        per-case `findings`); `build_report` just needs to render it.
-      - Run the test engine on every form the crawler finds, not only the seed page.
+- [x] **Step 4 — Report + crawl integration** — DONE
+      - Per-case pass/fail table = "Results by form" in `build_report` (`report.py`, 2026-06-27
+        redesign), incl. the data typed per case.
+      - Engine runs on every crawled page: `plan_node` → `execute_node` each lap, plus the
+        `ModalTester` scan. Verified on a demoqa 2-page crawl (2026-06-29).
 
 ---
 
@@ -313,6 +360,8 @@ Run with `uv sync --group gui` then `uv run qa-agent-gui`.
   streaming node-by-node progress to the UI via Qt signals; `astream(stream_mode="updates")`.
 - Config form (url/locale/auth/headless/max-pages), live findings + test-results + coverage,
   log console, History panel (re-renders past `reports/run-*`), Settings (writes `.env.local`).
+- **LLM provider dropdown (2026-06-29):** Groq (cloud) or Ollama (local `gemma4:e4b`) per run;
+  Groq-key check only enforced for Groq.
 - See `gui/README.md`. Note: "Max pages" overrides `agent_graph.MAX_ITERATIONS` per run.
 
 ## Scripts at a glance

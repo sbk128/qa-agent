@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
+    QWidget,
 )
 
 from gui.paths import DEFAULT_AUTH, set_env_value
@@ -57,7 +58,7 @@ class SettingsDialog(QDialog):
         form.addRow("GROQ_API_KEY", _wrap(key_row))
 
         self.provider = QComboBox()
-        self.provider.addItem("groq")
+        self.provider.addItems(["groq", "ollama"])
         self.provider.setCurrentText(os.environ.get("LLM_PROVIDER", "groq"))
         form.addRow("LLM_PROVIDER", self.provider)
 
@@ -186,9 +187,7 @@ class LoginDialog(QDialog):
         self.url_edit.setEnabled(True)
 
 
-def _wrap(layout) -> "QWidget":
-    from PySide6.QtWidgets import QWidget
-
+def _wrap(layout) -> QWidget:
     w = QWidget()
     layout.setContentsMargins(0, 0, 0, 0)
     w.setLayout(layout)

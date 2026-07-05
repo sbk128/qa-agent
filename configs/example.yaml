@@ -1,31 +1,35 @@
-# Example target config. Copy and edit per target app.
+# Example target config. Copy and edit, then: python -m src.main --config this.yaml
+# CLI flags (e.g. --url, --headless) override anything set here.
+
 target:
   url: "https://example.com"
+  # Extra pages to test directly. Useful for SPAs that navigate by buttons (no <a href>),
+  # so the crawler can't discover them on its own.
+  routes: []
+  locale: null            # e.g. "IN", "US" — overrides the LLM's country inference
 
-auth:
-  mode: "none"  # none | storage_state | credentials
-  storage_state_path: null
-  # login_url: ""
-  # username: ""
-  # password: ""
+llm:
+  provider: "groq"        # groq (cloud) | ollama (local)
+
+browser:
+  headless: true
 
 scope:
-  allowed_domains: ["example.com"]
-  max_depth: 5
-  max_iterations: 50
-  max_runtime_minutes: 15
+  allowed_domains: []     # empty = only the seed URL's host is crawled
+  max_iterations: 12      # crawl-lap cap
 
 safety:
-  destructive_action_policy: "block"  # block | confirm | allow
-  blocked_url_patterns: ["/logout", "/billing/charge"]
-  blocked_button_text_patterns: ["delete account", "pay now"]
+  # block  — refuse destructive clicks (default, safe)
+  # allow  — sandbox: click everything, including financial submits (dev targets only)
+  destructive_action_policy: "block"
+  blocked_url_patterns: ["/logout", "/billing/charge"]      # never navigated to
+  blocked_button_text_patterns: ["delete account", "pay now"]  # never clicked
 
-testing:
-  modes: ["happy", "edges"]
-  edge_case_intensity: "medium"  # low | medium | high
+auth:
+  mode: "none"            # none | storage_state
+  storage_state_path: null   # path to auth.json from scripts/login.py
 
 output:
   report_dir: "./reports"
-  formats: ["markdown", "html", "json"]
-  screenshots: true
-  trace: true
+  screenshots: true       # capture a screenshot for each non-passing case
+  trace: false            # write a Playwright trace.zip for the whole run

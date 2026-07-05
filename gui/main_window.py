@@ -19,9 +19,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread
+from PySide6.QtCore import Qt, QThread, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -190,9 +189,9 @@ class MainWindow(QWidget):
             "For dev/test targets only. Lets the agent click financial submits like "
             "'Submit Transaction' that the safety gate would otherwise block."
         )
-        # On by default: the usual target is a throwaway dev box where real submits
-        # are fine. Untick this before pointing the agent at anything with real data.
-        self.allow_all_check.setChecked(True)
+        # Off by default: safety stays ON unless you deliberately opt into sandbox mode.
+        # Only tick this for a throwaway dev box where real submits are fine.
+        self.allow_all_check.setChecked(False)
         form.addWidget(self.allow_all_check)
 
         # auth
@@ -406,8 +405,11 @@ class MainWindow(QWidget):
         n_find = len(state["findings"])
         self.card_findings.set_value(n_find, "#f78c6c" if n_find else None)
         results = state["test_results"]
-        passed = sum(1 for r in results if r.get("passed"))
-        self.card_tests.set_value(f"{passed}/{len(results)}" if results else "0")
+        # Count honestly by status: only pass/review cases have a real oracle, and
+        # only "pass" counts as passed. error/skipped/info are excluded from the ratio.
+        passed = sum(1 for r in results if r.get("status") == "pass")
+        scored = sum(1 for r in results if r.get("status") in ("pass", "review"))
+        self.card_tests.set_value(f"{passed}/{scored}" if scored else "0")
         self.card_iter.set_value(state["iteration"])
         if state.get("current_url"):
             self.current_url.setText("→ " + state["current_url"])
@@ -418,7 +420,13 @@ class MainWindow(QWidget):
 
     def _on_finished(self, summary: dict) -> None:
         self._set_running(False)
-        self.status_label.setText("Stopped" if summary.get("stopped") else "Done")
+        if summary.get("stopped"):
+            label = "Stopped"
+        elif summary.get("crashed"):
+            label = "Finished with errors"
+        else:
+            label = "Done"
+        self.status_label.setText(label)
         # final refresh from the authoritative summary
         self.findings_table.set_findings(summary["findings"])
         self.results_tree.set_results(summary["test_results"])
@@ -477,7 +485,7 @@ class MainWindow(QWidget):
         self.coverage_list.set_urls(run.visited_urls)
         self.card_visited.set_value(len(run.visited_urls))
         self.card_findings.set_value(len(run.findings))
-        self.card_tests.set_value(f"{run.tests_passed}/{len(run.test_results)}")
+        self.card_tests.set_value(f"{run.tests_passed}/{run.tests_scored}")
         self.card_iter.set_value("—")
         self.current_url.setText(f"(viewing past run: {run.name})")
         self._show_report(folder)
